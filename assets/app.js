@@ -1,7 +1,7 @@
 /* ================= CONFIG ================= */
 const CONFIG = {
   // Paste your Google Apps Script Web App URL here (ends with /exec)
-  API_URL: 'PASTE_YOUR_APPS_SCRIPT_URL_HERE'
+  API_URL: 'https://script.google.com/macros/s/AKfycbx3Pd2V28JEy_nnxZnemYYMhcTjTHIssGNvRdKlMHUNUSaF7djNw2cnufUEr-fSF3Jakg/exec'
 };
 
 /* ================= STATE ================= */
