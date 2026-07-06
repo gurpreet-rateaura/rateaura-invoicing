@@ -669,8 +669,9 @@ function renderSettings(main){
         </div>
         <div class="form-row">
           <div class="form-group"><label>Website</label><input type="text" id="s-website" value="${escapeHtml(c.website||'')}"></div>
-          <div class="form-group"><label>Logo</label><input type="file" id="s-logoFile" accept="image/*">
-            ${c.logoBase64 ? `<img src="${c.logoBase64}" class="logo-preview">` : ''}
+          <div class="form-group"><label>Logo</label><input type="file" id="s-logoFile" accept="image/png,image/jpeg,image/webp">
+            <img id="logo-preview-img" src="${c.logoBase64||''}" class="logo-preview" style="display:${c.logoBase64?'block':'none'}">
+            <div id="logo-status" style="color:var(--muted);font-size:0.78rem;margin-top:6px;"></div>
           </div>
         </div>
         <div class="section-title">Address</div>
@@ -720,9 +721,48 @@ function renderSettings(main){
 function handleLogoUpload(e){
   const file = e.target.files[0];
   if(!file) return;
+  const statusEl = document.getElementById('logo-status');
+  if(statusEl) statusEl.textContent = 'Processing logo…';
+
   const reader = new FileReader();
-  reader.onload = ()=>{ DATA.config.logoBase64 = reader.result; };
+  reader.onload = () => {
+    const img = new Image();
+    img.onload = () => {
+      const dataUrl = shrinkImageToFit(img, 420, 200, 42000);
+      DATA.config.logoBase64 = dataUrl;
+      const previewImg = document.getElementById('logo-preview-img');
+      if(previewImg){
+        previewImg.src = dataUrl;
+        previewImg.style.display = 'block';
+      }
+      if(statusEl) statusEl.textContent = 'Logo ready — click "Save Company Settings" below to save it.';
+    };
+    img.onerror = () => { if(statusEl) statusEl.textContent = 'Could not read that image file.'; };
+    img.src = reader.result;
+  };
+  reader.onerror = () => { if(statusEl) statusEl.textContent = 'Could not read that file.'; };
   reader.readAsDataURL(file);
+}
+
+// Draws the image onto a canvas, scaling it down until both its pixel
+// dimensions and its base64 size are small enough to store in one
+// Google Sheets cell (50,000 char limit) and to embed cleanly in the PDF.
+function shrinkImageToFit(img, maxWidth, maxHeight, maxChars){
+  let scale = Math.min(1, maxWidth / img.width, maxHeight / img.height);
+  let dataUrl = '';
+  for(let attempt=0; attempt<8; attempt++){
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0,0,w,h);
+    ctx.drawImage(img, 0, 0, w, h);
+    dataUrl = canvas.toDataURL('image/png');
+    if(dataUrl.length <= maxChars) break;
+    scale *= 0.75; // still too big — shrink further and try again
+  }
+  return dataUrl;
 }
 async function saveSettings(){
   const ids = ['companyName','email','phone','website','addressLine1','addressLine2','city','state','postalCode','country','bankName','bankAccountName','bankAccountNumber','bankIFSC','bankSwift','bankAddress','invoicePrefix','invoiceNextNumber'];
@@ -731,10 +771,17 @@ async function saveSettings(){
   if(DATA.config.logoBase64) payload.logoBase64 = DATA.config.logoBase64;
   const newPwd = document.getElementById('s-newPassword').value;
   if(newPwd && newPwd.length>=4) payload.passwordHash = await sha256hex(newPwd);
-  await apiPost('saveConfig', payload);
+  const result = await apiPost('saveConfig', payload);
   await reloadData();
-  document.getElementById('settings-saved').textContent = 'Saved ✓';
-  setTimeout(()=>{ const el=document.getElementById('settings-saved'); if(el) el.textContent=''; }, 2500);
+  const statusEl = document.getElementById('settings-saved');
+  if(result && result.error){
+    statusEl.style.color = 'var(--danger)';
+    statusEl.textContent = 'Could not save: ' + result.error;
+  }else{
+    statusEl.style.color = 'var(--success)';
+    statusEl.textContent = 'Saved ✓';
+    setTimeout(()=>{ if(statusEl) statusEl.textContent=''; }, 2500);
+  }
 }
 
 /* ================= MODAL ================= */
@@ -769,13 +816,23 @@ function downloadInvoicePDF(invId){
   const muted = [107,114,128];
 
   let y = 56;
-  // Logo + company block (left)
+  let logoOk = false;
+  // Logo + company block (left) — preserve aspect ratio inside a bounding box
   if(c.logoBase64){
-    try{ doc.addImage(c.logoBase64, 'PNG', margin, y-20, 110, 50, undefined, 'FAST'); }catch(e){}
+    try{
+      const fmtMatch = /^data:image\/(png|jpeg|jpg|webp);base64,/i.exec(c.logoBase64);
+      const fmt = fmtMatch ? fmtMatch[1].toUpperCase().replace('JPG','JPEG') : 'PNG';
+      const dims = doc.getImageProperties(c.logoBase64);
+      const boxW = 120, boxH = 54;
+      let w = boxW, h = boxW * (dims.height/dims.width);
+      if(h > boxH){ h = boxH; w = boxH * (dims.width/dims.height); }
+      doc.addImage(c.logoBase64, fmt, margin, y-24, w, h, undefined, 'FAST');
+      logoOk = true;
+    }catch(e){}
   }
   doc.setFont('helvetica','bold'); doc.setFontSize(14); doc.setTextColor(...ink);
-  doc.text(c.companyName || 'Company Name', margin, y + (c.logoBase64? 48 : 0));
-  let leftY = y + (c.logoBase64? 64 : 18);
+  doc.text(c.companyName || 'Company Name', margin, y + (logoOk? 48 : 0));
+  let leftY = y + (logoOk? 64 : 18);
   doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...muted);
   const addrLines = [c.addressLine1, c.addressLine2, [c.city,c.state,c.postalCode].filter(Boolean).join(', '), c.country].filter(Boolean);
   addrLines.forEach(line=>{ doc.text(line, margin, leftY); leftY += 12; });
