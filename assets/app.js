@@ -678,14 +678,14 @@ function openPayableModal(id){
       <div class="section-title" style="margin-top:6px;">INR Bill — Booking Details</div>
       <div class="form-row">
         <div class="form-group"><label>INR Buying Amount</label><input type="number" step="0.01" id="p-inramount" value="${p&&p.vendorType==='INR'?p.inrAmount:''}" oninput="updatePayablePreview()"></div>
-        <div class="form-group"><label>XE Rate at Booking (INR per USD)</label><input type="number" step="0.0001" id="p-bookingrate" value="${p&&p.vendorType==='INR'?p.bookingFxRate:''}" oninput="updatePayablePreview()"></div>
+        <div class="form-group"><label>System USD Amount (booked, incl. buffer)</label><input type="number" step="0.01" id="p-systemusd" value="${p&&p.vendorType==='INR'?p.systemUsdBuying:''}" oninput="updatePayablePreview()"></div>
       </div>
       <div class="form-group"><label>FX Buffer % (default 0.3%)</label><input type="number" step="0.01" id="p-bufferpct" value="${p&&p.vendorType==='INR'&&p.bufferPct!==''?p.bufferPct:'0.3'}" oninput="updatePayablePreview()"></div>
       <div class="card" style="background:var(--paper);box-shadow:none;">
         <div style="padding:14px 18px;font-size:0.88rem;">
-          <div class="settle-row"><span>Actual USD Buying (excl. buffer)</span><span class="amount" id="prev-actual">$0.00</span></div>
           <div class="settle-row"><span>Buffer Amount</span><span class="amount" id="prev-buffer">$0.00</span></div>
-          <div class="settle-row" style="font-weight:600;color:var(--ink);"><span>System USD Buying (incl. buffer)</span><span class="amount" id="prev-system">$0.00</span></div>
+          <div class="settle-row"><span>Actual USD Buying (excl. buffer)</span><span class="amount" id="prev-actual">$0.00</span></div>
+          <div class="settle-row" style="font-weight:600;color:var(--ink);"><span>Effective Booking FX Rate</span><span class="amount" id="prev-rate">—</span></div>
         </div>
       </div>
     </div>
@@ -707,12 +707,12 @@ function openPayableModal(id){
       };
       if(vendorType === 'INR'){
         const inrAmount = parseFloat(document.getElementById('p-inramount').value)||0;
-        const bookingFxRate = parseFloat(document.getElementById('p-bookingrate').value)||0;
+        const systemUsdBuying = parseFloat(document.getElementById('p-systemusd').value)||0;
         const bufferPct = parseFloat(document.getElementById('p-bufferpct').value)||0;
-        if(inrAmount<=0 || bookingFxRate<=0){ alert('Enter a valid INR amount and booking FX rate.'); return; }
-        const actualUsdBuying = inrAmount / bookingFxRate;
-        const bufferAmountUsd = actualUsdBuying * (bufferPct/100);
-        const systemUsdBuying = actualUsdBuying + bufferAmountUsd;
+        if(inrAmount<=0 || systemUsdBuying<=0){ alert('Enter a valid INR amount and System USD amount.'); return; }
+        const bufferAmountUsd = systemUsdBuying * (bufferPct/100);
+        const actualUsdBuying = systemUsdBuying - bufferAmountUsd;
+        const bookingFxRate = actualUsdBuying > 0 ? inrAmount / actualUsdBuying : 0;
         Object.assign(payload, { inrAmount, bookingFxRate, bufferPct, actualUsdBuying, bufferAmountUsd, systemUsdBuying, usdAmount:'' });
       }else{
         const usdAmount = parseFloat(document.getElementById('p-usdamount').value)||0;
@@ -735,14 +735,14 @@ function onPayableVendorChange(){
 }
 function updatePayablePreview(){
   const inrAmount = parseFloat(document.getElementById('p-inramount')?.value)||0;
-  const bookingFxRate = parseFloat(document.getElementById('p-bookingrate')?.value)||0;
+  const systemUsdBuying = parseFloat(document.getElementById('p-systemusd')?.value)||0;
   const bufferPct = parseFloat(document.getElementById('p-bufferpct')?.value)||0;
-  const actual = bookingFxRate>0 ? inrAmount/bookingFxRate : 0;
-  const buffer = actual * (bufferPct/100);
-  const system = actual + buffer;
+  const buffer = systemUsdBuying * (bufferPct/100);
+  const actual = systemUsdBuying - buffer;
+  const rate = actual>0 ? inrAmount/actual : 0;
   const a = document.getElementById('prev-actual'); if(a) a.textContent = '$'+fmtMoney(actual,'USD');
   const b = document.getElementById('prev-buffer'); if(b) b.textContent = '$'+fmtMoney(buffer,'USD');
-  const s = document.getElementById('prev-system'); if(s) s.textContent = '$'+fmtMoney(system,'USD');
+  const r = document.getElementById('prev-rate'); if(r) r.textContent = rate>0 ? rate.toFixed(4) : '—';
 }
 
 /* ---- Settlement (payable) ---- */
