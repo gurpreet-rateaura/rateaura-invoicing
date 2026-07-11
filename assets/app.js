@@ -113,6 +113,7 @@ function navigate(view){
     customers: renderCustomers,
     payables: renderPayables,
     vendors: renderVendors,
+    forex: renderForexReport,
     settings: renderSettings
   };
   main.innerHTML = '';
@@ -126,6 +127,60 @@ function paidForInvoice(invId){
 function paidForPayable(payId){
   return DATA.paysettlements.filter(p=>p.payableId===payId).reduce((s,p)=>s+Number(p.amount||0),0);
 }
+// The single "amount owed in USD" for a payable, regardless of vendor type —
+// USD vendors are billed directly in USD; INR vendors are booked in INR but
+// the systemUsdBuying figure (incl. FX buffer) is what will actually be remitted.
+function payableTotalUSD(p){
+  return p.vendorType === 'INR' ? Number(p.systemUsdBuying||0) : Number(p.usdAmount||0);
+}
+function remainingInrForPayable(p){
+  const settledInr = DATA.paysettlements.filter(s=>s.payableId===p.id).reduce((s,x)=>s+Number(x.inrAmountSettled||0),0);
+  return Number(p.inrAmount||0) - settledInr;
+}
+function vendorTypeOf(vendorId){
+  const v = DATA.vendors.find(v=>v.id===vendorId);
+  return v ? (v.vendorType||'USD') : 'USD';
+}
+function fxGainLossForPayable(p){
+  return DATA.paysettlements.filter(s=>s.payableId===p.id).reduce((s,x)=>s+Number(x.forexGainLoss||0),0);
+}
+function isFxSettlement(s){
+  // A settlement carries FX data only if it belongs to an INR-vendor payable
+  const p = DATA.payables.find(x=>x.id===s.payableId);
+  return p && p.vendorType === 'INR';
+}
+function forexTotals(){
+  const inrPayables = DATA.payables.filter(p=>p.vendorType==='INR');
+  const fxSettlements = DATA.paysettlements.filter(isFxSettlement);
+  const bufferBooked = inrPayables.reduce((s,p)=>s+Number(p.bufferAmountUsd||0),0);
+  const bufferRealized = fxSettlements.reduce((s,x)=>s+Number(x.allocatedBufferUsd||0),0);
+  const forexRealized = fxSettlements.reduce((s,x)=>s+Number(x.forexGainLoss||0),0); // +ve = net loss, -ve = net gain
+  const netPosition = bufferBooked - forexRealized;
+  return { bufferBooked, bufferRealized, forexRealized, netPosition, settlementCount: fxSettlements.length };
+}
+function monthlyForexSummary(){
+  const map = {};
+  DATA.paysettlements.filter(isFxSettlement).forEach(s=>{
+    const key = (s.date||'').slice(0,7) || 'Unknown';
+    if(!map[key]) map[key] = {month:key, gainLoss:0, buffer:0, count:0};
+    map[key].gainLoss += Number(s.forexGainLoss||0);
+    map[key].buffer += Number(s.allocatedBufferUsd||0);
+    map[key].count += 1;
+  });
+  return Object.values(map).sort((a,b)=> b.month.localeCompare(a.month));
+}
+function vendorForexSummary(){
+  const map = {};
+  DATA.paysettlements.filter(isFxSettlement).forEach(s=>{
+    const p = DATA.payables.find(x=>x.id===s.payableId);
+    const vId = p ? p.vendorId : 'unknown';
+    if(!map[vId]) map[vId] = {vendorId:vId, gainLoss:0, buffer:0, count:0};
+    map[vId].gainLoss += Number(s.forexGainLoss||0);
+    map[vId].buffer += Number(s.allocatedBufferUsd||0);
+    map[vId].count += 1;
+  });
+  return Object.values(map).sort((a,b)=> b.gainLoss - a.gainLoss);
+}
 function invoiceStatus(inv){
   const paid = paidForInvoice(inv.id);
   const total = Number(inv.total||0);
@@ -135,9 +190,9 @@ function invoiceStatus(inv){
 }
 function payableStatus(p){
   const paid = paidForPayable(p.id);
-  const total = Number(p.amount||0);
+  const total = payableTotalUSD(p);
   if(paid <= 0) return 'Unpaid';
-  if(paid < total) return 'Partially Paid';
+  if(paid < total - 0.004) return 'Partially Paid';
   return 'Paid';
 }
 function statusBadge(status){
@@ -149,7 +204,7 @@ function vendorName(id){ const v = DATA.vendors.find(v=>v.id===id); return v ? v
 
 /* ================= DASHBOARD ================= */
 function renderDashboard(main){
-  let recUSD=0, recINR=0, payUSD=0, payINR=0, overdueCount=0;
+  let recUSD=0, recINR=0, payUSD=0, overdueCount=0;
   DATA.invoices.forEach(inv=>{
     const outstanding = Number(inv.total||0) - paidForInvoice(inv.id);
     if(outstanding > 0.004){
@@ -158,11 +213,10 @@ function renderDashboard(main){
     }
   });
   DATA.payables.forEach(p=>{
-    const outstanding = Number(p.amount||0) - paidForPayable(p.id);
-    if(outstanding > 0.004){
-      if(p.currency==='INR') payINR += outstanding; else payUSD += outstanding;
-    }
+    const outstanding = payableTotalUSD(p) - paidForPayable(p.id);
+    if(outstanding > 0.004) payUSD += outstanding;
   });
+  const fx = forexTotals();
 
   main.innerHTML = `
     <div class="page-header">
@@ -171,8 +225,8 @@ function renderDashboard(main){
     <div class="kpi-grid">
       <div class="kpi-card"><div class="kpi-label">Receivable — USD</div><div class="kpi-value amount">$${fmtMoney(recUSD,'USD')}</div></div>
       <div class="kpi-card"><div class="kpi-label">Receivable — INR</div><div class="kpi-value amount">₹${fmtMoney(recINR,'INR')}</div></div>
-      <div class="kpi-card"><div class="kpi-label">Payable — USD</div><div class="kpi-value danger amount">$${fmtMoney(payUSD,'USD')}</div></div>
-      <div class="kpi-card"><div class="kpi-label">Payable — INR</div><div class="kpi-value danger amount">₹${fmtMoney(payINR,'INR')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Payable Outstanding — USD</div><div class="kpi-value danger amount">$${fmtMoney(payUSD,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Net Forex Position</div><div class="kpi-value amount ${fx.netPosition>=0?'success':'danger'}">$${fmtMoney(Math.abs(fx.netPosition),'USD')} ${fx.netPosition>=0?'favorable':'unfavorable'}</div></div>
     </div>
     <div class="card">
       <div class="card-head"><h3>Recent Invoices</h3><button class="btn" onclick="navigate('invoices')">View all</button></div>
@@ -184,7 +238,7 @@ function renderDashboard(main){
     <div class="card">
       <div class="card-head"><h3>Upcoming / Overdue Payables</h3><button class="btn" onclick="navigate('payables')">View all</button></div>
       <table>
-        <thead><tr><th>Bill #</th><th>Vendor</th><th>Due Date</th><th>Amount</th><th>Status</th></tr></thead>
+        <thead><tr><th>Bill #</th><th>Vendor</th><th>Due Date</th><th>Amount (USD)</th><th>Status</th></tr></thead>
         <tbody>${recentPayablesRows()}</tbody>
       </table>
     </div>
@@ -210,7 +264,7 @@ function recentPayablesRows(){
       <td class="mono">${escapeHtml(p.billNumber||'—')}</td>
       <td>${escapeHtml(vendorName(p.vendorId))}</td>
       <td>${fmtDate(p.dueDate)}</td>
-      <td class="amount">${symbolFor(p.currency)}${fmtMoney(p.amount, p.currency)}</td>
+      <td class="amount">$${fmtMoney(payableTotalUSD(p), 'USD')}</td>
       <td>${statusBadge(payableStatus(p))}</td>
     </tr>`).join('');
 }
@@ -468,16 +522,21 @@ function openCustomerModal(id){
 function renderVendors(main){
   main.innerHTML = `
     <div class="page-header">
-      <div><h2>Vendors</h2><p>Who you owe money to.</p></div>
+      <div><h2>Vendors</h2><p>Who you owe money to. Mark each vendor as a USD Vendor (billed &amp; settled directly in USD) or an INR Vendor (booked in INR, remitted in USD — tracked for FX gain/loss).</p></div>
       <button class="btn btn-gold" onclick="openVendorModal()">+ New Vendor</button>
     </div>
     <div class="card">
       <table>
-        <thead><tr><th>Name</th><th>Contact</th><th>Country</th><th>Default Currency</th><th></th></tr></thead>
+        <thead><tr><th>Name</th><th>Contact</th><th>Country</th><th>Type</th><th></th></tr></thead>
         <tbody>${vendorRows()}</tbody>
       </table>
     </div>
   `;
+}
+function vendorTypeBadge(type){
+  return type==='INR'
+    ? `<span class="badge badge-warn">INR Vendor</span>`
+    : `<span class="badge badge-muted">USD Vendor</span>`;
 }
 function vendorRows(){
   if(!DATA.vendors.length) return `<tr class="empty-row"><td colspan="5">No vendors yet.</td></tr>`;
@@ -486,7 +545,7 @@ function vendorRows(){
       <td><strong>${escapeHtml(v.name)}</strong><div style="color:var(--muted);font-size:0.8rem;">${escapeHtml(v.email||'')}</div></td>
       <td>${escapeHtml(v.contactPerson||'—')}${v.phone?(' · '+escapeHtml(v.phone)):''}</td>
       <td>${escapeHtml(v.country||'—')}</td>
-      <td>${escapeHtml(v.defaultCurrency||'USD')}</td>
+      <td>${vendorTypeBadge(v.vendorType||'USD')}</td>
       <td style="white-space:nowrap;">
         <button class="btn btn-sm" onclick="openVendorModal('${v.id}')">Edit</button>
         <button class="btn btn-sm btn-ghost" onclick="removeVendor('${v.id}')">✕</button>
@@ -514,8 +573,12 @@ function openVendorModal(id){
       <div class="form-group"><label>Country</label><input type="text" id="v-country" value="${v?escapeHtml(v.country||''):''}"></div>
     </div>
     <div class="form-group full"><label>Address</label><textarea id="v-address">${v?escapeHtml(v.address||''):''}</textarea></div>
-    <div class="form-group"><label>Default Currency</label>
-      <select id="v-currency"><option value="USD" ${v&&v.defaultCurrency==='USD'?'selected':''}>USD</option><option value="INR" ${v&&v.defaultCurrency==='INR'?'selected':''}>INR</option></select>
+    <div class="form-group">
+      <label>Vendor Type</label>
+      <select id="v-type">
+        <option value="USD" ${(!v||v.vendorType==='USD')?'selected':''}>USD Vendor — purchase &amp; settle in USD</option>
+        <option value="INR" ${v&&v.vendorType==='INR'?'selected':''}>INR Vendor — purchase in INR, remit in USD (FX tracked)</option>
+      </select>
     </div>
   `;
   openModal(id?'Edit Vendor':'New Vendor', body, [
@@ -530,7 +593,7 @@ function openVendorModal(id){
         phone: document.getElementById('v-phone').value,
         country: document.getElementById('v-country').value,
         address: document.getElementById('v-address').value,
-        defaultCurrency: document.getElementById('v-currency').value
+        vendorType: document.getElementById('v-type').value
       });
       await reloadData();
       closeModal();
@@ -543,28 +606,38 @@ function openVendorModal(id){
 function renderPayables(main){
   main.innerHTML = `
     <div class="page-header">
-      <div><h2>Payables</h2><p>Vendor bills you owe, and what's been settled.</p></div>
+      <div><h2>Payables</h2><p>Vendor bills you owe, and what's been settled. INR-vendor bills track FX buffer &amp; forex gain/loss automatically.</p></div>
       <button class="btn btn-gold" onclick="openPayableModal()">+ New Bill</button>
     </div>
     <div class="card">
       <table>
-        <thead><tr><th>Bill #</th><th>Vendor</th><th>Due Date</th><th>Amount</th><th>Outstanding</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Bill #</th><th>Vendor</th><th>Type</th><th>Due Date</th><th>Amount (USD)</th><th>Outstanding (USD)</th><th>FX Gain/Loss</th><th>Status</th><th></th></tr></thead>
         <tbody>${payableRows()}</tbody>
       </table>
     </div>
   `;
 }
+function fxGainLossCell(p){
+  if(p.vendorType !== 'INR') return `<span style="color:var(--muted);">—</span>`;
+  const gl = fxGainLossForPayable(p);
+  if(Math.abs(gl) < 0.005) return `<span style="color:var(--muted);">—</span>`;
+  const isLoss = gl > 0;
+  return `<span class="amount" style="color:${isLoss?'var(--danger)':'var(--success)'};">${isLoss?'-':'+'}$${fmtMoney(Math.abs(gl),'USD')}</span>`;
+}
 function payableRows(){
-  if(!DATA.payables.length) return `<tr class="empty-row"><td colspan="7">No payables yet.</td></tr>`;
+  if(!DATA.payables.length) return `<tr class="empty-row"><td colspan="9">No payables yet.</td></tr>`;
   return [...DATA.payables].sort((a,b)=> new Date(b.createdAt)-new Date(a.createdAt)).map(p=>{
+    const total = payableTotalUSD(p);
     const paid = paidForPayable(p.id);
-    const outstanding = Number(p.amount) - paid;
+    const outstanding = total - paid;
     return `<tr>
       <td class="mono">${escapeHtml(p.billNumber||'—')}</td>
       <td>${escapeHtml(vendorName(p.vendorId))}</td>
+      <td>${vendorTypeBadge(p.vendorType||'USD')}</td>
       <td>${fmtDate(p.dueDate)}</td>
-      <td class="amount">${symbolFor(p.currency)}${fmtMoney(p.amount,p.currency)}</td>
-      <td class="amount">${symbolFor(p.currency)}${fmtMoney(outstanding,p.currency)}</td>
+      <td class="amount">$${fmtMoney(total,'USD')}</td>
+      <td class="amount">$${fmtMoney(outstanding,'USD')}</td>
+      <td>${fxGainLossCell(p)}</td>
       <td>${statusBadge(payableStatus(p))}</td>
       <td style="white-space:nowrap;">
         <button class="btn btn-sm" onclick="openPaySettleModal('${p.id}')">Settle</button>
@@ -580,62 +653,121 @@ async function removePayable(id){
   await reloadData();
   navigate('payables');
 }
+
 function openPayableModal(id){
   const p = id ? DATA.payables.find(x=>x.id===id) : null;
-  const vendorOptions = DATA.vendors.map(v=>`<option value="${v.id}" ${p&&p.vendorId===v.id?'selected':''}>${escapeHtml(v.name)}</option>`).join('');
+  const vendorOptions = DATA.vendors.map(v=>`<option value="${v.id}" data-type="${v.vendorType||'USD'}" ${p&&p.vendorId===v.id?'selected':''}>${escapeHtml(v.name)} (${v.vendorType==='INR'?'INR':'USD'})</option>`).join('');
+  const initialType = p ? (p.vendorType||'USD') : (DATA.vendors[0] ? (DATA.vendors[0].vendorType||'USD') : 'USD');
+
   const body = `
     <div class="form-row">
-      <div class="form-group"><label>Vendor</label><select id="p-vendor">${vendorOptions || '<option value="">Add a vendor first</option>'}</select></div>
+      <div class="form-group"><label>Vendor</label><select id="p-vendor" onchange="onPayableVendorChange()">${vendorOptions || '<option value="">Add a vendor first</option>'}</select></div>
       <div class="form-group"><label>Bill / Reference #</label><input type="text" id="p-billnumber" value="${p?escapeHtml(p.billNumber||''):''}"></div>
     </div>
     <div class="form-row">
       <div class="form-group"><label>Bill Date</label><input type="date" id="p-billdate" value="${p?p.billDate:todayISO()}"></div>
       <div class="form-group"><label>Due Date</label><input type="date" id="p-duedate" value="${p?p.dueDate:''}"></div>
     </div>
-    <div class="form-row">
-      <div class="form-group"><label>Amount</label><input type="number" step="0.01" id="p-amount" value="${p?p.amount:''}"></div>
-      <div class="form-group"><label>Currency</label><select id="p-currency"><option value="USD" ${p&&p.currency==='USD'?'selected':''}>USD</option><option value="INR" ${p&&p.currency==='INR'?'selected':''}>INR</option></select></div>
+
+    <div id="p-usd-fields" style="display:${initialType==='USD'?'block':'none'};">
+      <div class="section-title" style="margin-top:6px;">USD Bill</div>
+      <div class="form-group"><label>Amount (USD)</label><input type="number" step="0.01" id="p-usdamount" value="${p&&p.vendorType==='USD'?p.usdAmount:''}"></div>
     </div>
-    <div class="form-group full"><label>Description</label><textarea id="p-description">${p?escapeHtml(p.description||''):''}</textarea></div>
+
+    <div id="p-inr-fields" style="display:${initialType==='INR'?'block':'none'};">
+      <div class="section-title" style="margin-top:6px;">INR Bill — Booking Details</div>
+      <div class="form-row">
+        <div class="form-group"><label>INR Buying Amount</label><input type="number" step="0.01" id="p-inramount" value="${p&&p.vendorType==='INR'?p.inrAmount:''}" oninput="updatePayablePreview()"></div>
+        <div class="form-group"><label>XE Rate at Booking (INR per USD)</label><input type="number" step="0.0001" id="p-bookingrate" value="${p&&p.vendorType==='INR'?p.bookingFxRate:''}" oninput="updatePayablePreview()"></div>
+      </div>
+      <div class="form-group"><label>FX Buffer % (default 0.3%)</label><input type="number" step="0.01" id="p-bufferpct" value="${p&&p.vendorType==='INR'&&p.bufferPct!==''?p.bufferPct:'0.3'}" oninput="updatePayablePreview()"></div>
+      <div class="card" style="background:var(--paper);box-shadow:none;">
+        <div style="padding:14px 18px;font-size:0.88rem;">
+          <div class="settle-row"><span>Actual USD Buying (excl. buffer)</span><span class="amount" id="prev-actual">$0.00</span></div>
+          <div class="settle-row"><span>Buffer Amount</span><span class="amount" id="prev-buffer">$0.00</span></div>
+          <div class="settle-row" style="font-weight:600;color:var(--ink);"><span>System USD Buying (incl. buffer)</span><span class="amount" id="prev-system">$0.00</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-group full" style="margin-top:14px;"><label>Remarks</label><textarea id="p-remarks">${p?escapeHtml(p.remarks||''):''}</textarea></div>
   `;
   openModal(id?'Edit Bill':'New Bill', body, [
     {label:'Cancel', cls:'btn', onClick:closeModal},
     {label:'Save', cls:'btn btn-gold', onClick: async ()=>{
       const vendorId = document.getElementById('p-vendor').value;
       if(!vendorId){ alert('Select a vendor.'); return; }
-      const amount = parseFloat(document.getElementById('p-amount').value)||0;
-      await apiPost('savePayable', {
-        id, vendorId,
+      const vendorType = vendorTypeOf(vendorId);
+      const payload = {
+        id, vendorId, vendorType,
         billNumber: document.getElementById('p-billnumber').value,
         billDate: document.getElementById('p-billdate').value,
         dueDate: document.getElementById('p-duedate').value,
-        amount, currency: document.getElementById('p-currency').value,
-        description: document.getElementById('p-description').value
-      });
+        remarks: document.getElementById('p-remarks').value
+      };
+      if(vendorType === 'INR'){
+        const inrAmount = parseFloat(document.getElementById('p-inramount').value)||0;
+        const bookingFxRate = parseFloat(document.getElementById('p-bookingrate').value)||0;
+        const bufferPct = parseFloat(document.getElementById('p-bufferpct').value)||0;
+        if(inrAmount<=0 || bookingFxRate<=0){ alert('Enter a valid INR amount and booking FX rate.'); return; }
+        const actualUsdBuying = inrAmount / bookingFxRate;
+        const bufferAmountUsd = actualUsdBuying * (bufferPct/100);
+        const systemUsdBuying = actualUsdBuying + bufferAmountUsd;
+        Object.assign(payload, { inrAmount, bookingFxRate, bufferPct, actualUsdBuying, bufferAmountUsd, systemUsdBuying, usdAmount:'' });
+      }else{
+        const usdAmount = parseFloat(document.getElementById('p-usdamount').value)||0;
+        if(usdAmount<=0){ alert('Enter a valid USD amount.'); return; }
+        Object.assign(payload, { usdAmount, inrAmount:'', bookingFxRate:'', bufferPct:'', actualUsdBuying:'', bufferAmountUsd:'', systemUsdBuying:'' });
+      }
+      await apiPost('savePayable', payload);
       await reloadData();
       closeModal();
       navigate('payables');
     }}
   ]);
+  updatePayablePreview();
 }
+function onPayableVendorChange(){
+  const sel = document.getElementById('p-vendor');
+  const type = vendorTypeOf(sel.value);
+  document.getElementById('p-usd-fields').style.display = type==='USD' ? 'block' : 'none';
+  document.getElementById('p-inr-fields').style.display = type==='INR' ? 'block' : 'none';
+}
+function updatePayablePreview(){
+  const inrAmount = parseFloat(document.getElementById('p-inramount')?.value)||0;
+  const bookingFxRate = parseFloat(document.getElementById('p-bookingrate')?.value)||0;
+  const bufferPct = parseFloat(document.getElementById('p-bufferpct')?.value)||0;
+  const actual = bookingFxRate>0 ? inrAmount/bookingFxRate : 0;
+  const buffer = actual * (bufferPct/100);
+  const system = actual + buffer;
+  const a = document.getElementById('prev-actual'); if(a) a.textContent = '$'+fmtMoney(actual,'USD');
+  const b = document.getElementById('prev-buffer'); if(b) b.textContent = '$'+fmtMoney(buffer,'USD');
+  const s = document.getElementById('prev-system'); if(s) s.textContent = '$'+fmtMoney(system,'USD');
+}
+
+/* ---- Settlement (payable) ---- */
 function openPaySettleModal(payId){
   const p = DATA.payables.find(x=>x.id===payId);
-  const paid = paidForPayable(payId);
-  const outstanding = Number(p.amount) - paid;
-  const history = DATA.paysettlements.filter(s=>s.payableId===payId);
+  if(p.vendorType === 'INR') return openPaySettleModalINR(p);
+  return openPaySettleModalUSD(p);
+}
+function openPaySettleModalUSD(p){
+  const paid = paidForPayable(p.id);
+  const outstanding = payableTotalUSD(p) - paid;
+  const history = DATA.paysettlements.filter(s=>s.payableId===p.id);
   const body = `
     <p style="margin-top:0;color:var(--muted);font-size:0.9rem;">
-      Bill <strong>${escapeHtml(p.billNumber||'—')}</strong> — Outstanding <strong>${symbolFor(p.currency)}${fmtMoney(outstanding,p.currency)}</strong>
+      Bill <strong>${escapeHtml(p.billNumber||'—')}</strong> — Outstanding <strong>$${fmtMoney(outstanding,'USD')}</strong>
     </p>
     <div class="form-row">
-      <div class="form-group"><label>Amount Paid</label><input type="number" id="ps-amount" step="0.01" value="${outstanding>0?outstanding.toFixed(2):''}"></div>
+      <div class="form-group"><label>Amount Paid (USD)</label><input type="number" id="ps-amount" step="0.01" value="${outstanding>0?outstanding.toFixed(2):''}"></div>
       <div class="form-group"><label>Date</label><input type="date" id="ps-date" value="${todayISO()}"></div>
     </div>
     <div class="form-group"><label>Method</label><input type="text" id="ps-method"></div>
     <div class="form-group full"><label>Note</label><input type="text" id="ps-note"></div>
     <div class="settle-list">
       <div class="section-title" style="margin:0 0 8px;">Settlement History</div>
-      ${history.length ? history.map(h=>`<div class="settle-row"><span>${fmtDate(h.date)} — ${escapeHtml(h.method||'')}</span><span class="amount">${symbolFor(p.currency)}${fmtMoney(h.amount,p.currency)}</span></div>`).join('') : '<div class="settle-row"><span>No settlements yet.</span></div>'}
+      ${history.length ? history.map(h=>`<div class="settle-row"><span>${fmtDate(h.date)} — ${escapeHtml(h.method||'')}</span><span class="amount">$${fmtMoney(h.amount,'USD')}</span></div>`).join('') : '<div class="settle-row"><span>No settlements yet.</span></div>'}
     </div>
   `;
   openModal('Settle Bill', body, [
@@ -643,12 +775,147 @@ function openPaySettleModal(payId){
     {label:'Record Payment', cls:'btn btn-gold', onClick: async ()=>{
       const amount = parseFloat(document.getElementById('ps-amount').value)||0;
       if(amount<=0){ alert('Enter a valid amount.'); return; }
-      await apiPost('addPaySettlement', {payableId:payId, date:document.getElementById('ps-date').value, amount, method:document.getElementById('ps-method').value, note:document.getElementById('ps-note').value});
+      await apiPost('addPaySettlement', {payableId:p.id, date:document.getElementById('ps-date').value, amount, method:document.getElementById('ps-method').value, note:document.getElementById('ps-note').value});
       await reloadData();
       closeModal();
       navigate('payables');
     }}
   ]);
+}
+function openPaySettleModalINR(p){
+  const remainingInr = remainingInrForPayable(p);
+  const paidUsd = paidForPayable(p.id);
+  const outstandingUsd = payableTotalUSD(p) - paidUsd;
+  const history = DATA.paysettlements.filter(s=>s.payableId===p.id);
+  const body = `
+    <p style="margin-top:0;color:var(--muted);font-size:0.9rem;">
+      Bill <strong>${escapeHtml(p.billNumber||'—')}</strong> — Remaining <strong>₹${fmtMoney(remainingInr,'INR')}</strong>
+      (≈ <strong>$${fmtMoney(outstandingUsd,'USD')}</strong> at booking rate)
+    </p>
+    <div class="form-row">
+      <div class="form-group"><label>INR Amount Being Settled</label><input type="number" id="ps-inr" step="0.01" value="${remainingInr>0?remainingInr.toFixed(2):''}" oninput="updateSettlePreview('${p.id}')"></div>
+      <div class="form-group"><label>Payment Date</label><input type="date" id="ps-date" value="${todayISO()}"></div>
+    </div>
+    <div class="form-group"><label>Today's FX Rate (INR per USD)</label><input type="number" id="ps-fxrate" step="0.0001" oninput="updateSettlePreview('${p.id}')"></div>
+    <div class="card" style="background:var(--paper);box-shadow:none;margin:10px 0;">
+      <div style="padding:14px 18px;font-size:0.88rem;">
+        <div class="settle-row"><span>USD Remitted</span><span class="amount" id="prev-usdpaid">$0.00</span></div>
+        <div class="settle-row"><span>Allocated Actual USD Buying</span><span class="amount" id="prev-allocactual">$0.00</span></div>
+        <div class="settle-row"><span>Allocated Buffer</span><span class="amount" id="prev-allocbuffer">$0.00</span></div>
+        <div class="settle-row"><span>FX Difference</span><span class="amount" id="prev-fxdiff">$0.00</span></div>
+        <div class="settle-row" style="font-weight:600;color:var(--ink);"><span>Actual Forex Gain/Loss</span><span class="amount" id="prev-forexgl">$0.00</span></div>
+      </div>
+    </div>
+    <div class="form-group"><label>Method</label><input type="text" id="ps-method"></div>
+    <div class="form-group full"><label>Note</label><input type="text" id="ps-note"></div>
+    <div class="settle-list">
+      <div class="section-title" style="margin:0 0 8px;">Settlement History</div>
+      ${history.length ? history.map(h=>{
+        const gl = Number(h.forexGainLoss||0);
+        return `<div class="settle-row"><span>${fmtDate(h.date)} — ₹${fmtMoney(h.inrAmountSettled,'INR')} @ ${h.paymentFxRate}</span><span class="amount" style="color:${gl>0?'var(--danger)':'var(--success)'};">${gl>0?'-':'+'}$${fmtMoney(Math.abs(gl),'USD')}</span></div>`;
+      }).join('') : '<div class="settle-row"><span>No settlements yet.</span></div>'}
+    </div>
+  `;
+  openModal('Settle Bill — INR Vendor (FX Tracked)', body, [
+    {label:'Close', cls:'btn', onClick:closeModal},
+    {label:'Record Payment', cls:'btn btn-gold', onClick: async ()=>{
+      const inrAmountSettled = parseFloat(document.getElementById('ps-inr').value)||0;
+      const paymentFxRate = parseFloat(document.getElementById('ps-fxrate').value)||0;
+      if(inrAmountSettled<=0 || paymentFxRate<=0){ alert('Enter a valid INR amount and FX rate.'); return; }
+      const inrAmount = Number(p.inrAmount||0);
+      const share = inrAmount>0 ? (inrAmountSettled/inrAmount) : 0;
+      const allocatedActualUsdBuying = Number(p.actualUsdBuying||0) * share;
+      const allocatedBufferUsd = Number(p.bufferAmountUsd||0) * share;
+      const paymentAmountUsd = inrAmountSettled / paymentFxRate;
+      const fxDifference = paymentAmountUsd - allocatedActualUsdBuying;
+      const forexGainLoss = fxDifference - allocatedBufferUsd;
+      await apiPost('addPaySettlement', {
+        payableId: p.id,
+        date: document.getElementById('ps-date').value,
+        amount: paymentAmountUsd,
+        inrAmountSettled, paymentFxRate,
+        allocatedActualUsdBuying, allocatedBufferUsd, fxDifference, forexGainLoss,
+        method: document.getElementById('ps-method').value,
+        note: document.getElementById('ps-note').value
+      });
+      await reloadData();
+      closeModal();
+      navigate('payables');
+    }}
+  ]);
+  updateSettlePreview(p.id);
+}
+function updateSettlePreview(payableId){
+  const p = DATA.payables.find(x=>x.id===payableId);
+  if(!p) return;
+  const inrAmountSettled = parseFloat(document.getElementById('ps-inr')?.value)||0;
+  const paymentFxRate = parseFloat(document.getElementById('ps-fxrate')?.value)||0;
+  const inrAmount = Number(p.inrAmount||0);
+  const share = inrAmount>0 ? (inrAmountSettled/inrAmount) : 0;
+  const allocatedActualUsdBuying = Number(p.actualUsdBuying||0) * share;
+  const allocatedBufferUsd = Number(p.bufferAmountUsd||0) * share;
+  const paymentAmountUsd = paymentFxRate>0 ? inrAmountSettled/paymentFxRate : 0;
+  const fxDifference = paymentAmountUsd - allocatedActualUsdBuying;
+  const forexGainLoss = fxDifference - allocatedBufferUsd;
+  const set = (id,val)=>{ const el=document.getElementById(id); if(el) el.textContent = val; };
+  set('prev-usdpaid', '$'+fmtMoney(paymentAmountUsd,'USD'));
+  set('prev-allocactual', '$'+fmtMoney(allocatedActualUsdBuying,'USD'));
+  set('prev-allocbuffer', '$'+fmtMoney(allocatedBufferUsd,'USD'));
+  set('prev-fxdiff', '$'+fmtMoney(fxDifference,'USD'));
+  const glEl = document.getElementById('prev-forexgl');
+  if(glEl){
+    glEl.textContent = (forexGainLoss>0?'Loss ':'Gain ') + '$'+fmtMoney(Math.abs(forexGainLoss),'USD');
+    glEl.style.color = forexGainLoss>0 ? 'var(--danger)' : 'var(--success)';
+  }
+}
+
+/* ================= FOREX REPORT ================= */
+function renderForexReport(main){
+  const fx = forexTotals();
+  const monthly = monthlyForexSummary();
+  const byVendor = vendorForexSummary();
+  main.innerHTML = `
+    <div class="page-header">
+      <div><h2>Forex Report</h2><p>How your FX buffer compares to actual currency movement on INR-vendor settlements.</p></div>
+    </div>
+    <div class="kpi-grid">
+      <div class="kpi-card"><div class="kpi-label">Total Buffer Booked</div><div class="kpi-value amount">$${fmtMoney(fx.bufferBooked,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Total Buffer Realized</div><div class="kpi-value amount">$${fmtMoney(fx.bufferRealized,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Total Forex Gain/Loss (Realized)</div><div class="kpi-value amount ${fx.forexRealized>0?'danger':'success'}">${fx.forexRealized>0?'-':'+'}$${fmtMoney(Math.abs(fx.forexRealized),'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Net Forex Position</div><div class="kpi-value amount ${fx.netPosition>=0?'success':'danger'}">$${fmtMoney(Math.abs(fx.netPosition),'USD')} ${fx.netPosition>=0?'favorable':'unfavorable'}</div></div>
+    </div>
+    <p style="color:var(--muted);font-size:0.82rem;margin-top:-14px;">
+      Net Forex Position = Total Buffer Booked − Total Forex Gain/Loss (Realized). Positive means your buffer has, on net, covered realized currency movement so far; negative means realized losses have exceeded the buffer collected.
+    </p>
+
+    <div class="card">
+      <div class="card-head"><h3>Monthly Forex Gain/Loss Summary</h3></div>
+      <table>
+        <thead><tr><th>Month</th><th>Settlements</th><th>Buffer Allocated</th><th>Forex Gain/Loss</th></tr></thead>
+        <tbody>${monthly.length ? monthly.map(m=>`
+          <tr>
+            <td>${escapeHtml(m.month)}</td>
+            <td>${m.count}</td>
+            <td class="amount">$${fmtMoney(m.buffer,'USD')}</td>
+            <td class="amount" style="color:${m.gainLoss>0?'var(--danger)':'var(--success)'};">${m.gainLoss>0?'-':'+'}$${fmtMoney(Math.abs(m.gainLoss),'USD')}</td>
+          </tr>`).join('') : '<tr class="empty-row"><td colspan="4">No INR-vendor settlements recorded yet.</td></tr>'}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Vendor-wise Forex Gain/Loss</h3></div>
+      <table>
+        <thead><tr><th>Vendor</th><th>Settlements</th><th>Buffer Allocated</th><th>Forex Gain/Loss</th></tr></thead>
+        <tbody>${byVendor.length ? byVendor.map(v=>`
+          <tr>
+            <td>${escapeHtml(vendorName(v.vendorId))}</td>
+            <td>${v.count}</td>
+            <td class="amount">$${fmtMoney(v.buffer,'USD')}</td>
+            <td class="amount" style="color:${v.gainLoss>0?'var(--danger)':'var(--success)'};">${v.gainLoss>0?'-':'+'}$${fmtMoney(Math.abs(v.gainLoss),'USD')}</td>
+          </tr>`).join('') : '<tr class="empty-row"><td colspan="4">No INR-vendor settlements recorded yet.</td></tr>'}</tbody>
+      </table>
+    </div>
+  `;
 }
 
 /* ================= SETTINGS (Company Master) ================= */
