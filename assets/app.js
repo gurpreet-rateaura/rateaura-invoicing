@@ -34,36 +34,95 @@ function uidTmp(){ return 'tmp_'+Math.random().toString(36).slice(2); }
 function escapeHtml(s){ return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 /* ================= API ================= */
+let AUTH_KEY = null;
+
+class ApiAuthError extends Error {
+  constructor(reason, lockUntil){
+    super('auth_error');
+    this.reason = reason;
+    this.lockUntil = lockUntil;
+  }
+}
+
+async function apiAuthStatus(){
+  const res = await fetch(CONFIG.API_URL + '?action=authstatus');
+  return res.json();
+}
 async function apiGet(){
-  const res = await fetch(CONFIG.API_URL + '?action=bootstrap');
+  const res = await fetch(CONFIG.API_URL + '?action=bootstrap&authKey=' + encodeURIComponent(AUTH_KEY||''));
   return res.json();
 }
 async function apiPost(action, payload){
   const res = await fetch(CONFIG.API_URL, {
     method:'POST',
     headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({action, payload})
+    body: JSON.stringify({action, payload, authKey: AUTH_KEY})
   });
   return res.json();
 }
 async function reloadData(){
-  DATA = await apiGet();
+  const result = await apiGet();
+  if(result && result.error === 'unauthorized'){
+    handleSessionInvalid();
+    throw new ApiAuthError(result.reason, result.lockUntil);
+  }
+  if(result && result.error){
+    throw new Error(result.error);
+  }
+  DATA = result;
+}
+// If a request comes back unauthorized while the app is already open (session went
+// stale, password changed elsewhere, etc.), drop back to the login screen instead of
+// leaving the UI in a broken half-loaded state.
+function handleSessionInvalid(){
+  sessionStorage.removeItem('rateaura_auth_key');
+  AUTH_KEY = null;
+  if(document.getElementById('app').classList.contains('active')){
+    alert('Your session is no longer valid — please log in again.');
+    location.reload();
+  }
 }
 
 /* ================= AUTH ================= */
 async function initApp(){
   document.getElementById('login-form').addEventListener('submit', handleLogin);
+
+  const storedKey = sessionStorage.getItem('rateaura_auth_key');
+  if(storedKey){
+    AUTH_KEY = storedKey;
+    try{
+      await reloadData();
+      enterApp();
+      return;
+    }catch(err){
+      if(err instanceof ApiAuthError){
+        sessionStorage.removeItem('rateaura_auth_key');
+        AUTH_KEY = null;
+        // fall through to show the normal login screen below
+      }else{
+        showConnectionRetry();
+        return;
+      }
+    }
+  }
+  await prepareLoginScreen();
+}
+async function prepareLoginScreen(){
+  const hintEl = document.querySelector('.login-hint');
   try{
-    await reloadData();
+    const status = await apiAuthStatus();
+    if(hintEl) hintEl.textContent = status.hasPassword
+      ? 'Enter your password to continue.'
+      : "First time here? Just set a password above — it'll become your login going forward.";
   }catch(err){
     document.getElementById('login-error').textContent = 'Could not reach the backend. Check API_URL in app.js.';
-    return;
   }
-  if(sessionStorage.getItem('rateaura_authed') === '1'){
-    enterApp();
-  }else{
-    document.getElementById('login-screen').style.display = 'flex';
-  }
+  document.getElementById('login-screen').style.display = 'flex';
+}
+function showConnectionRetry(){
+  const errEl = document.getElementById('login-error');
+  errEl.innerHTML = 'Connection problem — could not verify your session. <a href="#" onclick="location.reload();return false;" style="color:var(--brass);text-decoration:underline;">Retry</a>';
+  document.getElementById('login-screen').style.display = 'flex';
 }
 
 async function handleLogin(e){
@@ -71,28 +130,43 @@ async function handleLogin(e){
   const pwd = document.getElementById('login-password').value;
   const errEl = document.getElementById('login-error');
   errEl.textContent = '';
-
-  if(!DATA.config.passwordHash){
-    // First run: set a new password
-    if(pwd.length < 4){ errEl.textContent = 'Choose a password with at least 4 characters.'; return; }
-    const hash = await sha256hex(pwd);
-    await apiPost('saveConfig', {passwordHash: hash});
-    DATA.config.passwordHash = hash;
-    sessionStorage.setItem('rateaura_authed','1');
-    enterApp();
-    return;
-  }
   const hash = await sha256hex(pwd);
-  if(hash === DATA.config.passwordHash){
-    sessionStorage.setItem('rateaura_authed','1');
+
+  try{
+    const status = await apiAuthStatus();
+    if(!status.hasPassword){
+      if(pwd.length < 6){ errEl.textContent = 'Choose a password with at least 6 characters.'; return; }
+      const setRes = await apiPost('setInitialPassword', {passwordHash: hash});
+      if(setRes && setRes.error){ errEl.textContent = setRes.error; return; }
+      AUTH_KEY = hash;
+      await reloadData();
+      sessionStorage.setItem('rateaura_auth_key', hash);
+      enterApp();
+      return;
+    }
+
+    AUTH_KEY = hash;
+    await reloadData();
+    sessionStorage.setItem('rateaura_auth_key', hash);
     enterApp();
-  }else{
-    errEl.textContent = 'Incorrect password.';
+  }catch(err){
+    AUTH_KEY = null;
+    if(err instanceof ApiAuthError){
+      if(err.reason === 'locked'){
+        const until = err.lockUntil ? new Date(err.lockUntil).toLocaleTimeString() : 'a few minutes';
+        errEl.textContent = 'Too many failed attempts. Try again after ' + until + '.';
+      }else{
+        errEl.textContent = 'Incorrect password.';
+      }
+    }else{
+      errEl.textContent = 'Could not reach the backend. Check your connection and try again.';
+    }
   }
 }
 
 function logout(){
-  sessionStorage.removeItem('rateaura_authed');
+  sessionStorage.removeItem('rateaura_auth_key');
+  AUTH_KEY = null;
   location.reload();
 }
 
@@ -1042,16 +1116,28 @@ function inRange(dateStr, from, to){
   if(!dateStr) return false;
   return dateStr >= from && dateStr <= to;
 }
-function pnlTotals(from, to){
+// A received payment's USD value — looks up the parent invoice's currency,
+// since Payments themselves don't store a currency (they're always in the
+// invoice's currency).
+function paymentUsdAmount(payment){
   const reportingFxRate = Number(DATA.config.reportingFxRate||85);
+  const inv = DATA.invoices.find(i=>i.id===payment.invoiceId);
+  const amt = Number(payment.amount||0);
+  if(inv && inv.currency==='INR') return amt/reportingFxRate;
+  return amt;
+}
+// CASH / SETTLEMENT BASIS: revenue only counts once a client has actually paid,
+// and vendor cost only counts once you've actually remitted payment — not the
+// moment an invoice is issued or a bill is booked. This matches real cash P&L.
+function pnlTotals(from, to){
   let revenue = 0, cogs = 0, opex = 0;
-  DATA.invoices.forEach(inv=>{
-    if(!inRange(inv.issueDate, from, to)) return;
-    revenue += inv.currency==='INR' ? Number(inv.total||0)/reportingFxRate : Number(inv.total||0);
+  DATA.payments.forEach(pay=>{
+    if(!inRange(pay.date, from, to)) return;
+    revenue += paymentUsdAmount(pay);
   });
-  DATA.payables.forEach(p=>{
-    if(!inRange(p.billDate, from, to)) return;
-    cogs += payableTotalUSD(p);
+  DATA.paysettlements.forEach(s=>{
+    if(!inRange(s.date, from, to)) return;
+    cogs += Number(s.amount||0); // already USD, for both USD- and INR-vendor settlements
   });
   DATA.expenses.forEach(e=>{
     if(!inRange(e.date, from, to)) return;
@@ -1063,23 +1149,19 @@ function pnlTotals(from, to){
   return { revenue, cogs, opex, grossProfit, netProfit, margin };
 }
 function pnlMonthlyBreakdown(from, to){
-  const reportingFxRate = Number(DATA.config.reportingFxRate||85);
   const map = {};
   const touch = (key)=>{ if(!map[key]) map[key] = {month:key, revenue:0, cogs:0, opex:0}; return map[key]; };
-  DATA.invoices.forEach(inv=>{
-    if(!inRange(inv.issueDate, from, to)) return;
-    const key = inv.issueDate.slice(0,7);
-    touch(key).revenue += inv.currency==='INR' ? Number(inv.total||0)/reportingFxRate : Number(inv.total||0);
+  DATA.payments.forEach(pay=>{
+    if(!inRange(pay.date, from, to)) return;
+    touch(pay.date.slice(0,7)).revenue += paymentUsdAmount(pay);
   });
-  DATA.payables.forEach(p=>{
-    if(!inRange(p.billDate, from, to)) return;
-    const key = p.billDate.slice(0,7);
-    touch(key).cogs += payableTotalUSD(p);
+  DATA.paysettlements.forEach(s=>{
+    if(!inRange(s.date, from, to)) return;
+    touch(s.date.slice(0,7)).cogs += Number(s.amount||0);
   });
   DATA.expenses.forEach(e=>{
     if(!inRange(e.date, from, to)) return;
-    const key = e.date.slice(0,7);
-    touch(key).opex += expenseUsdEquivalent(e);
+    touch(e.date.slice(0,7)).opex += expenseUsdEquivalent(e);
   });
   return Object.values(map).sort((a,b)=> a.month.localeCompare(b.month));
 }
@@ -1104,7 +1186,7 @@ function renderProfitLoss(main, fromOverride, toOverride){
 
   main.innerHTML = `
     <div class="page-header">
-      <div><h2>Profit &amp; Loss</h2><p>Revenue vs. vendor cost vs. operating expenses, since business inception or any range you choose.</p></div>
+      <div><h2>Profit &amp; Loss</h2><p>Cash basis — only counts money you've actually <strong>received</strong> from customers and actually <strong>paid</strong> to vendors (not just invoiced/booked amounts), since business inception or any range you choose.</p></div>
     </div>
     <div class="card">
       <div style="padding:16px 20px;display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;">
@@ -1117,8 +1199,8 @@ function renderProfitLoss(main, fromOverride, toOverride){
       </div>
     </div>
     <div class="kpi-grid">
-      <div class="kpi-card"><div class="kpi-label">Total Revenue</div><div class="kpi-value amount">$${fmtMoney(t.revenue,'USD')}</div></div>
-      <div class="kpi-card"><div class="kpi-label">Vendor Cost (COGS)</div><div class="kpi-value amount danger">$${fmtMoney(t.cogs,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Revenue Received</div><div class="kpi-value amount">$${fmtMoney(t.revenue,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Vendor Payments Made</div><div class="kpi-value amount danger">$${fmtMoney(t.cogs,'USD')}</div></div>
       <div class="kpi-card"><div class="kpi-label">Gross Profit</div><div class="kpi-value amount ${t.grossProfit>=0?'success':'danger'}">$${fmtMoney(t.grossProfit,'USD')}</div></div>
       <div class="kpi-card"><div class="kpi-label">Operating Expenses</div><div class="kpi-value amount danger">$${fmtMoney(t.opex,'USD')}</div></div>
     </div>
@@ -1302,19 +1384,35 @@ async function saveSettings(){
   const payload = {};
   ids.forEach(id=> payload[id] = document.getElementById('s-'+id).value);
   if(DATA.config.logoBase64) payload.logoBase64 = DATA.config.logoBase64;
-  const newPwd = document.getElementById('s-newPassword').value;
-  if(newPwd && newPwd.length>=4) payload.passwordHash = await sha256hex(newPwd);
-  const result = await apiPost('saveConfig', payload);
-  await reloadData();
   const statusEl = document.getElementById('settings-saved');
+
+  const newPwd = document.getElementById('s-newPassword').value;
+  let newHash = null;
+  if(newPwd){
+    if(newPwd.length < 6){
+      statusEl.style.color = 'var(--danger)';
+      statusEl.textContent = 'New password must be at least 6 characters.';
+      return;
+    }
+    newHash = await sha256hex(newPwd);
+    payload.passwordHash = newHash;
+  }
+
+  const result = await apiPost('saveConfig', payload);
   if(result && result.error){
     statusEl.style.color = 'var(--danger)';
     statusEl.textContent = 'Could not save: ' + result.error;
-  }else{
-    statusEl.style.color = 'var(--success)';
-    statusEl.textContent = 'Saved ✓';
-    setTimeout(()=>{ if(statusEl) statusEl.textContent=''; }, 2500);
+    return;
   }
+  if(newHash){
+    AUTH_KEY = newHash;
+    sessionStorage.setItem('rateaura_auth_key', newHash);
+    document.getElementById('s-newPassword').value = '';
+  }
+  await reloadData();
+  statusEl.style.color = 'var(--success)';
+  statusEl.textContent = 'Saved ✓';
+  setTimeout(()=>{ if(statusEl) statusEl.textContent=''; }, 2500);
 }
 
 /* ================= MODAL ================= */
