@@ -5,7 +5,7 @@ const CONFIG = {
 };
 
 /* ================= STATE ================= */
-let DATA = { config:{}, customers:[], vendors:[], invoices:[], payments:[], payables:[], paysettlements:[] };
+let DATA = { config:{}, customers:[], vendors:[], invoices:[], payments:[], payables:[], paysettlements:[], expenses:[] };
 let CURRENT_VIEW = 'dashboard';
 let EDIT_INVOICE_ID = null;
 let INVOICE_ITEMS = [];
@@ -114,6 +114,8 @@ function navigate(view){
     payables: renderPayables,
     vendors: renderVendors,
     forex: renderForexReport,
+    expenses: renderExpenses,
+    pnl: renderProfitLoss,
     settings: renderSettings
   };
   main.innerHTML = '';
@@ -217,6 +219,7 @@ function renderDashboard(main){
     if(outstanding > 0.004) payUSD += outstanding;
   });
   const fx = forexTotals();
+  const pnl = pnlTotals(DATA.config.businessStartDate || '2026-02-01', todayISO());
 
   main.innerHTML = `
     <div class="page-header">
@@ -227,6 +230,10 @@ function renderDashboard(main){
       <div class="kpi-card"><div class="kpi-label">Receivable — INR</div><div class="kpi-value amount">₹${fmtMoney(recINR,'INR')}</div></div>
       <div class="kpi-card"><div class="kpi-label">Payable Outstanding — USD</div><div class="kpi-value danger amount">$${fmtMoney(payUSD,'USD')}</div></div>
       <div class="kpi-card"><div class="kpi-label">Net Forex Position</div><div class="kpi-value amount ${fx.netPosition>=0?'success':'danger'}">$${fmtMoney(Math.abs(fx.netPosition),'USD')} ${fx.netPosition>=0?'favorable':'unfavorable'}</div></div>
+      <div class="kpi-card" style="cursor:pointer;border-color:${pnl.netProfit>=0?'var(--success)':'var(--danger)'};" onclick="navigate('pnl')">
+        <div class="kpi-label">Net ${pnl.netProfit>=0?'Profit':'Loss'} (Since Inception) →</div>
+        <div class="kpi-value amount ${pnl.netProfit>=0?'success':'danger'}">$${fmtMoney(Math.abs(pnl.netProfit),'USD')}</div>
+      </div>
     </div>
     <div class="card">
       <div class="card-head"><h3>Recent Invoices</h3><button class="btn" onclick="navigate('invoices')">View all</button></div>
@@ -918,6 +925,259 @@ function renderForexReport(main){
   `;
 }
 
+/* ================= EXPENSES ================= */
+const EXPENSE_CATEGORIES = ['Salaries','IT & Server','Rent','Marketing','Travel','Bank Charges','Professional Fees','Software & Subscriptions','Office Supplies','Other'];
+
+function expenseUsdEquivalent(exp){
+  return Number(exp.usdEquivalent||0);
+}
+function renderExpenses(main){
+  main.innerHTML = `
+    <div class="page-header">
+      <div><h2>Expenses</h2><p>Salaries, server/IT costs, and every other operating expense — feeds directly into Profit &amp; Loss.</p></div>
+      <button class="btn btn-gold" onclick="openExpenseModal()">+ New Expense</button>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>Date</th><th>Category</th><th>Description</th><th>Paid To</th><th>Amount</th><th>USD Equivalent</th><th></th></tr></thead>
+        <tbody>${expenseRows()}</tbody>
+      </table>
+    </div>
+  `;
+}
+function expenseRows(){
+  if(!DATA.expenses.length) return `<tr class="empty-row"><td colspan="7">No expenses recorded yet.</td></tr>`;
+  return [...DATA.expenses].sort((a,b)=> new Date(b.date)-new Date(a.date)).map(e=>`
+    <tr>
+      <td>${fmtDate(e.date)}</td>
+      <td><span class="badge badge-muted">${escapeHtml(e.category||'Other')}</span></td>
+      <td>${escapeHtml(e.description||'—')}</td>
+      <td>${escapeHtml(e.paidTo||'—')}</td>
+      <td class="amount">${symbolFor(e.currency)}${fmtMoney(e.amount, e.currency)}</td>
+      <td class="amount">$${fmtMoney(expenseUsdEquivalent(e),'USD')}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-sm" onclick="openExpenseModal('${e.id}')">Edit</button>
+        <button class="btn btn-sm btn-ghost" onclick="removeExpense('${e.id}')">✕</button>
+      </td>
+    </tr>`).join('');
+}
+async function removeExpense(id){
+  if(!confirm('Delete this expense?')) return;
+  await apiPost('deleteExpense', {id});
+  await reloadData();
+  navigate('expenses');
+}
+function openExpenseModal(id){
+  const e = id ? DATA.expenses.find(x=>x.id===id) : null;
+  const catOptions = EXPENSE_CATEGORIES.map(c=>`<option value="${c}" ${e&&e.category===c?'selected':''}>${c}</option>`).join('');
+  const currency = e ? e.currency : 'USD';
+  const body = `
+    <div class="form-row">
+      <div class="form-group"><label>Category</label><select id="ex-category">${catOptions}</select></div>
+      <div class="form-group"><label>Date</label><input type="date" id="ex-date" value="${e?e.date:todayISO()}"></div>
+    </div>
+    <div class="form-group full"><label>Description</label><input type="text" id="ex-description" value="${e?escapeHtml(e.description||''):''}" placeholder="e.g. July server hosting — AWS"></div>
+    <div class="form-row">
+      <div class="form-group"><label>Currency</label><select id="ex-currency" onchange="onExpenseCurrencyChange()">
+        <option value="USD" ${currency==='USD'?'selected':''}>USD</option>
+        <option value="INR" ${currency==='INR'?'selected':''}>INR</option>
+      </select></div>
+      <div class="form-group"><label>Amount</label><input type="number" step="0.01" id="ex-amount" value="${e?e.amount:''}" oninput="updateExpensePreview()"></div>
+    </div>
+    <div class="form-group" id="ex-fxrate-group" style="display:${currency==='INR'?'block':'none'};">
+      <label>FX Rate Used (INR per USD)</label><input type="number" step="0.0001" id="ex-fxrate" value="${e?e.fxRate:''}" oninput="updateExpensePreview()">
+    </div>
+    <div class="settle-row" style="border-top:1px solid var(--border);padding-top:10px;">
+      <span>USD Equivalent</span><span class="amount" id="ex-usdpreview" style="font-weight:600;">$0.00</span>
+    </div>
+    <div class="form-row" style="margin-top:14px;">
+      <div class="form-group full"><label>Paid To (optional)</label><input type="text" id="ex-paidto" value="${e?escapeHtml(e.paidTo||''):''}"></div>
+    </div>
+    <div class="form-group full"><label>Remarks</label><textarea id="ex-remarks">${e?escapeHtml(e.remarks||''):''}</textarea></div>
+  `;
+  openModal(id?'Edit Expense':'New Expense', body, [
+    {label:'Cancel', cls:'btn', onClick:closeModal},
+    {label:'Save', cls:'btn btn-gold', onClick: async ()=>{
+      const currency = document.getElementById('ex-currency').value;
+      const amount = parseFloat(document.getElementById('ex-amount').value)||0;
+      if(amount<=0){ alert('Enter a valid amount.'); return; }
+      let fxRate = '', usdEquivalent = amount;
+      if(currency==='INR'){
+        fxRate = parseFloat(document.getElementById('ex-fxrate').value)||0;
+        if(fxRate<=0){ alert('Enter the FX rate used for this INR expense.'); return; }
+        usdEquivalent = amount / fxRate;
+      }
+      await apiPost('upsertExpense', {
+        id,
+        category: document.getElementById('ex-category').value,
+        description: document.getElementById('ex-description').value,
+        date: document.getElementById('ex-date').value,
+        currency, amount, fxRate, usdEquivalent,
+        paidTo: document.getElementById('ex-paidto').value,
+        remarks: document.getElementById('ex-remarks').value
+      });
+      await reloadData();
+      closeModal();
+      navigate('expenses');
+    }}
+  ]);
+  updateExpensePreview();
+}
+function onExpenseCurrencyChange(){
+  const currency = document.getElementById('ex-currency').value;
+  document.getElementById('ex-fxrate-group').style.display = currency==='INR' ? 'block' : 'none';
+  updateExpensePreview();
+}
+function updateExpensePreview(){
+  const currency = document.getElementById('ex-currency')?.value;
+  const amount = parseFloat(document.getElementById('ex-amount')?.value)||0;
+  const fxRate = parseFloat(document.getElementById('ex-fxrate')?.value)||0;
+  const usd = currency==='INR' ? (fxRate>0 ? amount/fxRate : 0) : amount;
+  const el = document.getElementById('ex-usdpreview');
+  if(el) el.textContent = '$'+fmtMoney(usd,'USD');
+}
+
+/* ================= PROFIT & LOSS ================= */
+function inRange(dateStr, from, to){
+  if(!dateStr) return false;
+  return dateStr >= from && dateStr <= to;
+}
+function pnlTotals(from, to){
+  const reportingFxRate = Number(DATA.config.reportingFxRate||85);
+  let revenue = 0, cogs = 0, opex = 0;
+  DATA.invoices.forEach(inv=>{
+    if(!inRange(inv.issueDate, from, to)) return;
+    revenue += inv.currency==='INR' ? Number(inv.total||0)/reportingFxRate : Number(inv.total||0);
+  });
+  DATA.payables.forEach(p=>{
+    if(!inRange(p.billDate, from, to)) return;
+    cogs += payableTotalUSD(p);
+  });
+  DATA.expenses.forEach(e=>{
+    if(!inRange(e.date, from, to)) return;
+    opex += expenseUsdEquivalent(e);
+  });
+  const grossProfit = revenue - cogs;
+  const netProfit = grossProfit - opex;
+  const margin = revenue > 0 ? (netProfit/revenue*100) : 0;
+  return { revenue, cogs, opex, grossProfit, netProfit, margin };
+}
+function pnlMonthlyBreakdown(from, to){
+  const reportingFxRate = Number(DATA.config.reportingFxRate||85);
+  const map = {};
+  const touch = (key)=>{ if(!map[key]) map[key] = {month:key, revenue:0, cogs:0, opex:0}; return map[key]; };
+  DATA.invoices.forEach(inv=>{
+    if(!inRange(inv.issueDate, from, to)) return;
+    const key = inv.issueDate.slice(0,7);
+    touch(key).revenue += inv.currency==='INR' ? Number(inv.total||0)/reportingFxRate : Number(inv.total||0);
+  });
+  DATA.payables.forEach(p=>{
+    if(!inRange(p.billDate, from, to)) return;
+    const key = p.billDate.slice(0,7);
+    touch(key).cogs += payableTotalUSD(p);
+  });
+  DATA.expenses.forEach(e=>{
+    if(!inRange(e.date, from, to)) return;
+    const key = e.date.slice(0,7);
+    touch(key).opex += expenseUsdEquivalent(e);
+  });
+  return Object.values(map).sort((a,b)=> a.month.localeCompare(b.month));
+}
+function expenseCategoryBreakdown(from, to){
+  const map = {};
+  DATA.expenses.forEach(e=>{
+    if(!inRange(e.date, from, to)) return;
+    const key = e.category || 'Other';
+    if(!map[key]) map[key] = {category:key, total:0, count:0};
+    map[key].total += expenseUsdEquivalent(e);
+    map[key].count += 1;
+  });
+  return Object.values(map).sort((a,b)=> b.total - a.total);
+}
+function renderProfitLoss(main, fromOverride, toOverride){
+  const defaultFrom = DATA.config.businessStartDate || '2026-02-01';
+  const from = fromOverride || defaultFrom;
+  const to = toOverride || todayISO();
+  const t = pnlTotals(from, to);
+  const monthly = pnlMonthlyBreakdown(from, to);
+  const byCategory = expenseCategoryBreakdown(from, to);
+
+  main.innerHTML = `
+    <div class="page-header">
+      <div><h2>Profit &amp; Loss</h2><p>Revenue vs. vendor cost vs. operating expenses, since business inception or any range you choose.</p></div>
+    </div>
+    <div class="card">
+      <div style="padding:16px 20px;display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;">
+        <div class="form-group" style="margin-bottom:0;"><label>From</label><input type="date" id="pnl-from" value="${from}"></div>
+        <div class="form-group" style="margin-bottom:0;"><label>To</label><input type="date" id="pnl-to" value="${to}"></div>
+        <button class="btn btn-gold btn-sm" onclick="applyPnlFilter()">Apply</button>
+        <button class="btn btn-sm" onclick="setPnlRange('${defaultFrom}','${todayISO()}')">Since Inception</button>
+        <button class="btn btn-sm" onclick="setPnlRangeThisMonth()">This Month</button>
+        <button class="btn btn-sm" onclick="setPnlRangeThisYear()">This Year</button>
+      </div>
+    </div>
+    <div class="kpi-grid">
+      <div class="kpi-card"><div class="kpi-label">Total Revenue</div><div class="kpi-value amount">$${fmtMoney(t.revenue,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Vendor Cost (COGS)</div><div class="kpi-value amount danger">$${fmtMoney(t.cogs,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Gross Profit</div><div class="kpi-value amount ${t.grossProfit>=0?'success':'danger'}">$${fmtMoney(t.grossProfit,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Operating Expenses</div><div class="kpi-value amount danger">$${fmtMoney(t.opex,'USD')}</div></div>
+    </div>
+    <div class="kpi-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));">
+      <div class="kpi-card" style="border-color:${t.netProfit>=0?'var(--success)':'var(--danger)'};">
+        <div class="kpi-label">Net ${t.netProfit>=0?'Profit':'Loss'}</div>
+        <div class="kpi-value amount ${t.netProfit>=0?'success':'danger'}">$${fmtMoney(Math.abs(t.netProfit),'USD')}</div>
+      </div>
+      <div class="kpi-card"><div class="kpi-label">Profit Margin</div><div class="kpi-value amount ${t.margin>=0?'success':'danger'}">${t.margin.toFixed(1)}%</div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Monthly Trend</h3></div>
+      <table>
+        <thead><tr><th>Month</th><th>Revenue</th><th>Vendor Cost</th><th>Gross Profit</th><th>OpEx</th><th>Net P&amp;L</th></tr></thead>
+        <tbody>${monthly.length ? monthly.map(m=>{
+          const gp = m.revenue - m.cogs; const net = gp - m.opex;
+          return `<tr>
+            <td>${escapeHtml(m.month)}</td>
+            <td class="amount">$${fmtMoney(m.revenue,'USD')}</td>
+            <td class="amount">$${fmtMoney(m.cogs,'USD')}</td>
+            <td class="amount">$${fmtMoney(gp,'USD')}</td>
+            <td class="amount">$${fmtMoney(m.opex,'USD')}</td>
+            <td class="amount" style="color:${net>=0?'var(--success)':'var(--danger)'};font-weight:600;">${net>=0?'':'-'}$${fmtMoney(Math.abs(net),'USD')}</td>
+          </tr>`;
+        }).join('') : '<tr class="empty-row"><td colspan="6">No activity in this range.</td></tr>'}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Expenses by Category</h3></div>
+      <table>
+        <thead><tr><th>Category</th><th>Entries</th><th>Total (USD)</th></tr></thead>
+        <tbody>${byCategory.length ? byCategory.map(c=>`
+          <tr><td>${escapeHtml(c.category)}</td><td>${c.count}</td><td class="amount">$${fmtMoney(c.total,'USD')}</td></tr>
+        `).join('') : '<tr class="empty-row"><td colspan="3">No expenses in this range.</td></tr>'}</tbody>
+      </table>
+    </div>
+  `;
+}
+function applyPnlFilter(){
+  const from = document.getElementById('pnl-from').value;
+  const to = document.getElementById('pnl-to').value;
+  renderProfitLoss(document.getElementById('main-content'), from, to);
+}
+function setPnlRange(from, to){
+  renderProfitLoss(document.getElementById('main-content'), from, to);
+}
+function setPnlRangeThisMonth(){
+  const now = new Date();
+  const from = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0,10);
+  setPnlRange(from, todayISO());
+}
+function setPnlRangeThisYear(){
+  const now = new Date();
+  const from = new Date(now.getFullYear(), 0, 1).toISOString().slice(0,10);
+  setPnlRange(from, todayISO());
+}
+
 /* ================= SETTINGS (Company Master) ================= */
 function renderSettings(main){
   const c = DATA.config;
@@ -974,6 +1234,12 @@ function renderSettings(main){
           <div class="form-group"><label>Prefix</label><input type="text" id="s-invoicePrefix" value="${escapeHtml(c.invoicePrefix||'RA-INV-')}"></div>
           <div class="form-group"><label>Next Number</label><input type="number" id="s-invoiceNextNumber" value="${escapeHtml(c.invoiceNextNumber||'1001')}"></div>
         </div>
+        <div class="section-title">Profit &amp; Loss Reporting</div>
+        <div class="form-row">
+          <div class="form-group"><label>Business Start Date</label><input type="date" id="s-businessStartDate" value="${escapeHtml(c.businessStartDate||'2026-02-01')}"></div>
+          <div class="form-group"><label>Reporting FX Rate (INR per USD)</label><input type="number" step="0.01" id="s-reportingFxRate" value="${escapeHtml(c.reportingFxRate||'85')}"></div>
+        </div>
+        <p style="color:var(--muted);font-size:0.78rem;margin-top:-8px;">The Reporting FX Rate is only used to convert any INR-currency <em>customer invoices</em> into USD for the consolidated Profit &amp; Loss report — it does not affect individual invoices or payables.</p>
         <div class="section-title">Change Password</div>
         <div class="form-row">
           <div class="form-group full"><label>New Password (leave blank to keep current)</label><input type="password" id="s-newPassword"></div>
@@ -1032,7 +1298,7 @@ function shrinkImageToFit(img, maxWidth, maxHeight, maxChars){
   return dataUrl;
 }
 async function saveSettings(){
-  const ids = ['companyName','email','phone','website','addressLine1','addressLine2','city','state','postalCode','country','bankName','bankAccountName','bankAccountNumber','bankIFSC','bankSwift','bankAddress','invoicePrefix','invoiceNextNumber'];
+  const ids = ['companyName','email','phone','website','addressLine1','addressLine2','city','state','postalCode','country','bankName','bankAccountName','bankAccountNumber','bankIFSC','bankSwift','bankAddress','invoicePrefix','invoiceNextNumber','businessStartDate','reportingFxRate'];
   const payload = {};
   ids.forEach(id=> payload[id] = document.getElementById('s-'+id).value);
   if(DATA.config.logoBase64) payload.logoBase64 = DATA.config.logoBase64;
