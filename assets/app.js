@@ -5,7 +5,7 @@ const CONFIG = {
 };
 
 /* ================= STATE ================= */
-let DATA = { config:{}, customers:[], vendors:[], invoices:[], payments:[], payables:[], paysettlements:[], expenses:[] };
+let DATA = { config:{}, customers:[], vendors:[], invoices:[], payments:[], payables:[], paysettlements:[], expenses:[], customerAdvances:[], vendorAdvances:[] };
 let CURRENT_VIEW = 'dashboard';
 let EDIT_INVOICE_ID = null;
 let INVOICE_ITEMS = [];
@@ -190,6 +190,7 @@ function navigate(view){
     forex: renderForexReport,
     expenses: renderExpenses,
     pnl: renderProfitLoss,
+    advances: renderAdvances,
     settings: renderSettings
   };
   main.innerHTML = '';
@@ -208,6 +209,33 @@ function paidForPayable(payId){
 // the systemUsdBuying figure (incl. FX buffer) is what will actually be remitted.
 function payableTotalUSD(p){
   return p.vendorType === 'INR' ? Number(p.systemUsdBuying||0) : Number(p.usdAmount||0);
+}
+/* ---- Advances ---- */
+function customerAdvanceTotal(customerId, currency){
+  return DATA.customerAdvances.filter(a=>a.customerId===customerId && a.currency===currency).reduce((s,a)=>s+Number(a.amount||0),0);
+}
+function customerAdvanceApplied(customerId, currency){
+  return DATA.payments.filter(p=>{
+    if(p.source !== 'advance') return false;
+    const inv = DATA.invoices.find(i=>i.id===p.invoiceId);
+    return inv && inv.customerId===customerId && inv.currency===currency;
+  }).reduce((s,p)=>s+Number(p.amount||0),0);
+}
+function customerAdvanceAvailable(customerId, currency){
+  return customerAdvanceTotal(customerId, currency) - customerAdvanceApplied(customerId, currency);
+}
+function vendorAdvanceTotal(vendorId){
+  return DATA.vendorAdvances.filter(a=>a.vendorId===vendorId).reduce((s,a)=>s+Number(a.amount||0),0);
+}
+function vendorAdvanceApplied(vendorId){
+  return DATA.paysettlements.filter(s=>{
+    if(s.source !== 'advance') return false;
+    const p = DATA.payables.find(x=>x.id===s.payableId);
+    return p && p.vendorId===vendorId;
+  }).reduce((s,x)=>s+Number(x.amount||0),0);
+}
+function vendorAdvanceAvailable(vendorId){
+  return vendorAdvanceTotal(vendorId) - vendorAdvanceApplied(vendorId);
 }
 function remainingInrForPayable(p){
   const settledInr = DATA.paysettlements.filter(s=>s.payableId===p.id).reduce((s,x)=>s+Number(x.inrAmountSettled||0),0);
@@ -494,6 +522,7 @@ function openSettleModal(invId){
   const paid = paidForInvoice(invId);
   const outstanding = Number(inv.total) - paid;
   const history = DATA.payments.filter(p=>p.invoiceId===invId);
+  const availableAdvance = customerAdvanceAvailable(inv.customerId, inv.currency);
   const body = `
     <p style="margin-top:0;color:var(--muted);font-size:0.9rem;">
       Invoice <strong class="invoice-number">${escapeHtml(inv.invoiceNumber)}</strong> —
@@ -506,9 +535,18 @@ function openSettleModal(invId){
     </div>
     <div class="form-group"><label>Method (wire, PayPal, etc.)</label><input type="text" id="s-method"></div>
     <div class="form-group full"><label>Note</label><input type="text" id="s-note"></div>
+    ${availableAdvance > 0.004 ? `
+    <div class="card" style="background:var(--paper);box-shadow:none;margin:6px 0 14px;">
+      <div style="padding:12px 16px;font-size:0.85rem;">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;color:var(--ink);cursor:pointer;">
+          <input type="checkbox" id="s-from-advance" style="width:auto;">
+          Apply from advance balance instead of new cash — available ${symbolFor(inv.currency)}${fmtMoney(availableAdvance,inv.currency)}
+        </label>
+      </div>
+    </div>` : ''}
     <div class="settle-list">
       <div class="section-title" style="margin:0 0 8px;">Payment History</div>
-      ${history.length ? history.map(h=>`<div class="settle-row"><span>${fmtDate(h.date)} — ${escapeHtml(h.method||'')} ${escapeHtml(h.note?('— '+h.note):'')}</span><span class="amount">${symbolFor(inv.currency)}${fmtMoney(h.amount,inv.currency)}</span></div>`).join('') : '<div class="settle-row"><span>No payments recorded yet.</span></div>'}
+      ${history.length ? history.map(h=>`<div class="settle-row"><span>${fmtDate(h.date)} — ${escapeHtml(h.method||'')} ${escapeHtml(h.note?('— '+h.note):'')}${h.source==='advance'?' <em>(from advance)</em>':''}</span><span class="amount">${symbolFor(inv.currency)}${fmtMoney(h.amount,inv.currency)}</span></div>`).join('') : '<div class="settle-row"><span>No payments recorded yet.</span></div>'}
     </div>
   `;
   openModal('Settle Invoice', body, [
@@ -516,7 +554,14 @@ function openSettleModal(invId){
     {label:'Record Payment', cls:'btn btn-gold', onClick: async ()=>{
       const amount = parseFloat(document.getElementById('s-amount').value)||0;
       if(amount<=0){ alert('Enter a valid amount.'); return; }
-      await apiPost('addPayment', {invoiceId:invId, date:document.getElementById('s-date').value, amount, method:document.getElementById('s-method').value, note:document.getElementById('s-note').value});
+      const fromAdvance = document.getElementById('s-from-advance')?.checked;
+      if(fromAdvance && amount > availableAdvance + 0.005){ alert('Amount exceeds available advance balance.'); return; }
+      await apiPost('addPayment', {
+        invoiceId:invId, date:document.getElementById('s-date').value, amount,
+        method: fromAdvance ? 'Advance Balance' : document.getElementById('s-method').value,
+        note:document.getElementById('s-note').value,
+        source: fromAdvance ? 'advance' : ''
+      });
       await reloadData();
       closeModal();
       navigate('invoices');
@@ -836,6 +881,7 @@ function openPaySettleModalUSD(p){
   const paid = paidForPayable(p.id);
   const outstanding = payableTotalUSD(p) - paid;
   const history = DATA.paysettlements.filter(s=>s.payableId===p.id);
+  const availableAdvance = vendorAdvanceAvailable(p.vendorId);
   const body = `
     <p style="margin-top:0;color:var(--muted);font-size:0.9rem;">
       Bill <strong>${escapeHtml(p.billNumber||'—')}</strong> — Outstanding <strong>$${fmtMoney(outstanding,'USD')}</strong>
@@ -846,9 +892,18 @@ function openPaySettleModalUSD(p){
     </div>
     <div class="form-group"><label>Method</label><input type="text" id="ps-method"></div>
     <div class="form-group full"><label>Note</label><input type="text" id="ps-note"></div>
+    ${availableAdvance > 0.004 ? `
+    <div class="card" style="background:var(--paper);box-shadow:none;margin:6px 0 14px;">
+      <div style="padding:12px 16px;font-size:0.85rem;">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;color:var(--ink);cursor:pointer;">
+          <input type="checkbox" id="ps-from-advance" style="width:auto;">
+          Pay from vendor advance balance instead of new remittance — available $${fmtMoney(availableAdvance,'USD')}
+        </label>
+      </div>
+    </div>` : ''}
     <div class="settle-list">
       <div class="section-title" style="margin:0 0 8px;">Settlement History</div>
-      ${history.length ? history.map(h=>`<div class="settle-row"><span>${fmtDate(h.date)} — ${escapeHtml(h.method||'')}</span><span class="amount">$${fmtMoney(h.amount,'USD')}</span></div>`).join('') : '<div class="settle-row"><span>No settlements yet.</span></div>'}
+      ${history.length ? history.map(h=>`<div class="settle-row"><span>${fmtDate(h.date)} — ${escapeHtml(h.method||'')}${h.source==='advance'?' <em>(from advance)</em>':''}</span><span class="amount">$${fmtMoney(h.amount,'USD')}</span></div>`).join('') : '<div class="settle-row"><span>No settlements yet.</span></div>'}
     </div>
   `;
   openModal('Settle Bill', body, [
@@ -856,7 +911,14 @@ function openPaySettleModalUSD(p){
     {label:'Record Payment', cls:'btn btn-gold', onClick: async ()=>{
       const amount = parseFloat(document.getElementById('ps-amount').value)||0;
       if(amount<=0){ alert('Enter a valid amount.'); return; }
-      await apiPost('addPaySettlement', {payableId:p.id, date:document.getElementById('ps-date').value, amount, method:document.getElementById('ps-method').value, note:document.getElementById('ps-note').value});
+      const fromAdvance = document.getElementById('ps-from-advance')?.checked;
+      if(fromAdvance && amount > availableAdvance + 0.005){ alert('Amount exceeds available advance balance.'); return; }
+      await apiPost('addPaySettlement', {
+        payableId:p.id, date:document.getElementById('ps-date').value, amount,
+        method: fromAdvance ? 'Advance Balance' : document.getElementById('ps-method').value,
+        note:document.getElementById('ps-note').value,
+        source: fromAdvance ? 'advance' : ''
+      });
       await reloadData();
       closeModal();
       navigate('payables');
@@ -868,6 +930,7 @@ function openPaySettleModalINR(p){
   const paidUsd = paidForPayable(p.id);
   const outstandingUsd = payableTotalUSD(p) - paidUsd;
   const history = DATA.paysettlements.filter(s=>s.payableId===p.id);
+  const availableAdvance = vendorAdvanceAvailable(p.vendorId);
   const body = `
     <p style="margin-top:0;color:var(--muted);font-size:0.9rem;">
       Bill <strong>${escapeHtml(p.billNumber||'—')}</strong> — Remaining <strong>₹${fmtMoney(remainingInr,'INR')}</strong>
@@ -877,7 +940,7 @@ function openPaySettleModalINR(p){
       <div class="form-group"><label>INR Amount Being Settled</label><input type="number" id="ps-inr" step="0.01" value="${remainingInr>0?remainingInr.toFixed(2):''}" oninput="updateSettlePreview('${p.id}')"></div>
       <div class="form-group"><label>Payment Date</label><input type="date" id="ps-date" value="${todayISO()}"></div>
     </div>
-    <div class="form-group"><label>Today's FX Rate (INR per USD)</label><input type="number" id="ps-fxrate" step="0.0001" oninput="updateSettlePreview('${p.id}')"></div>
+    <div class="form-group"><label>${availableAdvance>0.004?'FX Rate (use the rate this advance was originally paid at)':"Today's FX Rate (INR per USD)"}</label><input type="number" id="ps-fxrate" step="0.0001" oninput="updateSettlePreview('${p.id}')"></div>
     <div class="card" style="background:var(--paper);box-shadow:none;margin:10px 0;">
       <div style="padding:14px 18px;font-size:0.88rem;">
         <div class="settle-row"><span>USD Remitted</span><span class="amount" id="prev-usdpaid">$0.00</span></div>
@@ -889,11 +952,20 @@ function openPaySettleModalINR(p){
     </div>
     <div class="form-group"><label>Method</label><input type="text" id="ps-method"></div>
     <div class="form-group full"><label>Note</label><input type="text" id="ps-note"></div>
+    ${availableAdvance > 0.004 ? `
+    <div class="card" style="background:var(--paper);box-shadow:none;margin:6px 0 14px;">
+      <div style="padding:12px 16px;font-size:0.85rem;">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;color:var(--ink);cursor:pointer;">
+          <input type="checkbox" id="ps-from-advance" style="width:auto;">
+          Pay from vendor advance balance instead of new remittance — available $${fmtMoney(availableAdvance,'USD')}
+        </label>
+      </div>
+    </div>` : ''}
     <div class="settle-list">
       <div class="section-title" style="margin:0 0 8px;">Settlement History</div>
       ${history.length ? history.map(h=>{
         const gl = Number(h.forexGainLoss||0);
-        return `<div class="settle-row"><span>${fmtDate(h.date)} — ₹${fmtMoney(h.inrAmountSettled,'INR')} @ ${h.paymentFxRate}</span><span class="amount" style="color:${gl>0?'var(--danger)':'var(--success)'};">${gl>0?'-':'+'}$${fmtMoney(Math.abs(gl),'USD')}</span></div>`;
+        return `<div class="settle-row"><span>${fmtDate(h.date)} — ₹${fmtMoney(h.inrAmountSettled,'INR')} @ ${h.paymentFxRate}${h.source==='advance'?' <em>(from advance)</em>':''}</span><span class="amount" style="color:${gl>0?'var(--danger)':'var(--success)'};">${gl>0?'-':'+'}$${fmtMoney(Math.abs(gl),'USD')}</span></div>`;
       }).join('') : '<div class="settle-row"><span>No settlements yet.</span></div>'}
     </div>
   `;
@@ -910,14 +982,17 @@ function openPaySettleModalINR(p){
       const paymentAmountUsd = inrAmountSettled / paymentFxRate;
       const fxDifference = paymentAmountUsd - allocatedActualUsdBuying;
       const forexGainLoss = fxDifference - allocatedBufferUsd;
+      const fromAdvance = document.getElementById('ps-from-advance')?.checked;
+      if(fromAdvance && paymentAmountUsd > availableAdvance + 0.005){ alert('This settlement (' + fmtMoney(paymentAmountUsd,'USD') + ' USD) exceeds the available advance balance.'); return; }
       await apiPost('addPaySettlement', {
         payableId: p.id,
         date: document.getElementById('ps-date').value,
         amount: paymentAmountUsd,
         inrAmountSettled, paymentFxRate,
         allocatedActualUsdBuying, allocatedBufferUsd, fxDifference, forexGainLoss,
-        method: document.getElementById('ps-method').value,
-        note: document.getElementById('ps-note').value
+        method: fromAdvance ? 'Advance Balance' : document.getElementById('ps-method').value,
+        note: document.getElementById('ps-note').value,
+        source: fromAdvance ? 'advance' : ''
       });
       await reloadData();
       closeModal();
@@ -1132,12 +1207,22 @@ function paymentUsdAmount(payment){
 function pnlTotals(from, to){
   let revenue = 0, cogs = 0, opex = 0;
   DATA.payments.forEach(pay=>{
+    if(pay.source === 'advance') return; // already counted as revenue when the advance itself came in
     if(!inRange(pay.date, from, to)) return;
     revenue += paymentUsdAmount(pay);
   });
+  DATA.customerAdvances.forEach(a=>{
+    if(!inRange(a.date, from, to)) return;
+    revenue += a.currency==='INR' ? Number(a.amount||0)/Number(DATA.config.reportingFxRate||85) : Number(a.amount||0);
+  });
   DATA.paysettlements.forEach(s=>{
+    if(s.source === 'advance') return; // already counted as cost when the advance itself was paid out
     if(!inRange(s.date, from, to)) return;
     cogs += Number(s.amount||0); // already USD, for both USD- and INR-vendor settlements
+  });
+  DATA.vendorAdvances.forEach(a=>{
+    if(!inRange(a.date, from, to)) return;
+    cogs += Number(a.amount||0);
   });
   DATA.expenses.forEach(e=>{
     if(!inRange(e.date, from, to)) return;
@@ -1152,12 +1237,23 @@ function pnlMonthlyBreakdown(from, to){
   const map = {};
   const touch = (key)=>{ if(!map[key]) map[key] = {month:key, revenue:0, cogs:0, opex:0}; return map[key]; };
   DATA.payments.forEach(pay=>{
+    if(pay.source === 'advance') return;
     if(!inRange(pay.date, from, to)) return;
     touch(pay.date.slice(0,7)).revenue += paymentUsdAmount(pay);
   });
+  DATA.customerAdvances.forEach(a=>{
+    if(!inRange(a.date, from, to)) return;
+    const usd = a.currency==='INR' ? Number(a.amount||0)/Number(DATA.config.reportingFxRate||85) : Number(a.amount||0);
+    touch(a.date.slice(0,7)).revenue += usd;
+  });
   DATA.paysettlements.forEach(s=>{
+    if(s.source === 'advance') return;
     if(!inRange(s.date, from, to)) return;
     touch(s.date.slice(0,7)).cogs += Number(s.amount||0);
+  });
+  DATA.vendorAdvances.forEach(a=>{
+    if(!inRange(a.date, from, to)) return;
+    touch(a.date.slice(0,7)).cogs += Number(a.amount||0);
   });
   DATA.expenses.forEach(e=>{
     if(!inRange(e.date, from, to)) return;
@@ -1258,6 +1354,187 @@ function setPnlRangeThisYear(){
   const now = new Date();
   const from = new Date(now.getFullYear(), 0, 1).toISOString().slice(0,10);
   setPnlRange(from, todayISO());
+}
+
+/* ================= ADVANCES ================= */
+function renderAdvances(main){
+  main.innerHTML = `
+    <div class="page-header">
+      <div><h2>Advances</h2><p>Prepayments received from customers or sent to vendors, ahead of any specific invoice or bill — apply them later when you settle.</p></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Customer Advances (money received in advance)</h3><button class="btn btn-gold btn-sm" onclick="openCustomerAdvanceModal()">+ Record Advance</button></div>
+      <table>
+        <thead><tr><th>Customer</th><th>Currency</th><th>Total Received</th><th>Applied</th><th>Available</th></tr></thead>
+        <tbody>${customerAdvanceSummaryRows()}</tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Customer Advance Entries</h3></div>
+      <table>
+        <thead><tr><th>Date</th><th>Customer</th><th>Currency</th><th>Amount</th><th>Method</th><th>Note</th><th></th></tr></thead>
+        <tbody>${customerAdvanceRows()}</tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Vendor Advances (money you've paid in advance)</h3><button class="btn btn-gold btn-sm" onclick="openVendorAdvanceModal()">+ Record Advance</button></div>
+      <table>
+        <thead><tr><th>Vendor</th><th>Total Paid</th><th>Applied</th><th>Available</th></tr></thead>
+        <tbody>${vendorAdvanceSummaryRows()}</tbody>
+      </table>
+    </div>
+    <div class="card">
+      <div class="card-head"><h3>Vendor Advance Entries</h3></div>
+      <table>
+        <thead><tr><th>Date</th><th>Vendor</th><th>Amount (USD)</th><th>Method</th><th>Note</th><th></th></tr></thead>
+        <tbody>${vendorAdvanceRows()}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function customerAdvanceSummaryRows(){
+  const map = {};
+  DATA.customerAdvances.forEach(a=>{
+    const key = a.customerId+'|'+a.currency;
+    if(!map[key]) map[key] = {customerId:a.customerId, currency:a.currency};
+  });
+  const keys = Object.values(map);
+  if(!keys.length) return `<tr class="empty-row"><td colspan="5">No customer advances recorded yet.</td></tr>`;
+  return keys.map(k=>{
+    const total = customerAdvanceTotal(k.customerId, k.currency);
+    const applied = customerAdvanceApplied(k.customerId, k.currency);
+    const available = total - applied;
+    return `<tr>
+      <td>${escapeHtml(customerName(k.customerId))}</td>
+      <td>${k.currency}</td>
+      <td class="amount">${symbolFor(k.currency)}${fmtMoney(total,k.currency)}</td>
+      <td class="amount">${symbolFor(k.currency)}${fmtMoney(applied,k.currency)}</td>
+      <td class="amount" style="font-weight:600;color:${available>0.004?'var(--success)':'var(--muted)'};">${symbolFor(k.currency)}${fmtMoney(available,k.currency)}</td>
+    </tr>`;
+  }).join('');
+}
+function customerAdvanceRows(){
+  if(!DATA.customerAdvances.length) return `<tr class="empty-row"><td colspan="7">No entries yet.</td></tr>`;
+  return [...DATA.customerAdvances].sort((a,b)=> new Date(b.date)-new Date(a.date)).map(a=>`
+    <tr>
+      <td>${fmtDate(a.date)}</td>
+      <td>${escapeHtml(customerName(a.customerId))}</td>
+      <td>${a.currency}</td>
+      <td class="amount">${symbolFor(a.currency)}${fmtMoney(a.amount,a.currency)}</td>
+      <td>${escapeHtml(a.method||'—')}</td>
+      <td>${escapeHtml(a.note||'—')}</td>
+      <td><button class="btn btn-sm btn-ghost" onclick="removeCustomerAdvance('${a.id}')">✕</button></td>
+    </tr>`).join('');
+}
+async function removeCustomerAdvance(id){
+  if(!confirm('Delete this advance record? If any of it has already been applied to invoices, the available balance may go negative — check before deleting.')) return;
+  await apiPost('deleteCustomerAdvance', {id});
+  await reloadData();
+  navigate('advances');
+}
+function openCustomerAdvanceModal(){
+  const customerOptions = DATA.customers.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+  const body = `
+    <div class="form-row">
+      <div class="form-group"><label>Customer</label><select id="ca-customer">${customerOptions || '<option value="">Add a customer first</option>'}</select></div>
+      <div class="form-group"><label>Date</label><input type="date" id="ca-date" value="${todayISO()}"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Currency</label><select id="ca-currency"><option value="USD">USD</option><option value="INR">INR</option></select></div>
+      <div class="form-group"><label>Amount</label><input type="number" step="0.01" id="ca-amount"></div>
+    </div>
+    <div class="form-group"><label>Method</label><input type="text" id="ca-method" placeholder="e.g. Wire, PayPal"></div>
+    <div class="form-group full"><label>Note</label><input type="text" id="ca-note"></div>
+  `;
+  openModal('Record Customer Advance', body, [
+    {label:'Cancel', cls:'btn', onClick:closeModal},
+    {label:'Save', cls:'btn btn-gold', onClick: async ()=>{
+      const customerId = document.getElementById('ca-customer').value;
+      if(!customerId){ alert('Select a customer.'); return; }
+      const amount = parseFloat(document.getElementById('ca-amount').value)||0;
+      if(amount<=0){ alert('Enter a valid amount.'); return; }
+      await apiPost('upsertCustomerAdvance', {
+        customerId,
+        date: document.getElementById('ca-date').value,
+        currency: document.getElementById('ca-currency').value,
+        amount,
+        method: document.getElementById('ca-method').value,
+        note: document.getElementById('ca-note').value
+      });
+      await reloadData();
+      closeModal();
+      navigate('advances');
+    }}
+  ]);
+}
+
+function vendorAdvanceSummaryRows(){
+  const vendorIds = [...new Set(DATA.vendorAdvances.map(a=>a.vendorId))];
+  if(!vendorIds.length) return `<tr class="empty-row"><td colspan="4">No vendor advances recorded yet.</td></tr>`;
+  return vendorIds.map(vId=>{
+    const total = vendorAdvanceTotal(vId);
+    const applied = vendorAdvanceApplied(vId);
+    const available = total - applied;
+    return `<tr>
+      <td>${escapeHtml(vendorName(vId))}</td>
+      <td class="amount">$${fmtMoney(total,'USD')}</td>
+      <td class="amount">$${fmtMoney(applied,'USD')}</td>
+      <td class="amount" style="font-weight:600;color:${available>0.004?'var(--success)':'var(--muted)'};">$${fmtMoney(available,'USD')}</td>
+    </tr>`;
+  }).join('');
+}
+function vendorAdvanceRows(){
+  if(!DATA.vendorAdvances.length) return `<tr class="empty-row"><td colspan="5">No entries yet.</td></tr>`;
+  return [...DATA.vendorAdvances].sort((a,b)=> new Date(b.date)-new Date(a.date)).map(a=>`
+    <tr>
+      <td>${fmtDate(a.date)}</td>
+      <td>${escapeHtml(vendorName(a.vendorId))}</td>
+      <td class="amount">$${fmtMoney(a.amount,'USD')}</td>
+      <td>${escapeHtml(a.method||'—')}</td>
+      <td>${escapeHtml(a.note||'—')}</td>
+      <td><button class="btn btn-sm btn-ghost" onclick="removeVendorAdvance('${a.id}')">✕</button></td>
+    </tr>`).join('');
+}
+async function removeVendorAdvance(id){
+  if(!confirm('Delete this advance record? If any of it has already been applied to bills, the available balance may go negative — check before deleting.')) return;
+  await apiPost('deleteVendorAdvance', {id});
+  await reloadData();
+  navigate('advances');
+}
+function openVendorAdvanceModal(){
+  const vendorOptions = DATA.vendors.map(v=>`<option value="${v.id}">${escapeHtml(v.name)} (${v.vendorType==='INR'?'INR':'USD'})</option>`).join('');
+  const body = `
+    <div class="form-row">
+      <div class="form-group"><label>Vendor</label><select id="va-vendor">${vendorOptions || '<option value="">Add a vendor first</option>'}</select></div>
+      <div class="form-group"><label>Date</label><input type="date" id="va-date" value="${todayISO()}"></div>
+    </div>
+    <div class="form-group"><label>Amount (USD — the actual amount remitted)</label><input type="number" step="0.01" id="va-amount"></div>
+    <div class="form-group"><label>Method</label><input type="text" id="va-method" placeholder="e.g. Wire, SWIFT"></div>
+    <div class="form-group full"><label>Note</label><input type="text" id="va-note"></div>
+    <p style="color:var(--muted);font-size:0.8rem;">For an INR vendor, when you later apply this advance to a specific bill, you'll enter the INR amount and FX rate at that time — same as a normal settlement — so forex gain/loss still gets tracked correctly.</p>
+  `;
+  openModal('Record Vendor Advance', body, [
+    {label:'Cancel', cls:'btn', onClick:closeModal},
+    {label:'Save', cls:'btn btn-gold', onClick: async ()=>{
+      const vendorId = document.getElementById('va-vendor').value;
+      if(!vendorId){ alert('Select a vendor.'); return; }
+      const amount = parseFloat(document.getElementById('va-amount').value)||0;
+      if(amount<=0){ alert('Enter a valid amount.'); return; }
+      await apiPost('upsertVendorAdvance', {
+        vendorId,
+        date: document.getElementById('va-date').value,
+        amount,
+        method: document.getElementById('va-method').value,
+        note: document.getElementById('va-note').value
+      });
+      await reloadData();
+      closeModal();
+      navigate('advances');
+    }}
+  ]);
 }
 
 /* ================= SETTINGS (Company Master) ================= */
