@@ -3,7 +3,6 @@ const CONFIG = {
   // Paste your Google Apps Script Web App URL here (ends with /exec)
   API_URL: 'https://script.google.com/macros/s/AKfycbylMR1hO1-oPJA6-Z7XyQWs9YCkc5Xyq3SddPjyMb0Pid5SgkX1qDHiABKTinyrjjUGEA/exec'
 };
-
 /* ================= STATE ================= */
 let DATA = { config:{}, customers:[], vendors:[], invoices:[], payments:[], payables:[], paysettlements:[], expenses:[], customerAdvances:[], vendorAdvances:[] };
 let CURRENT_VIEW = 'dashboard';
@@ -269,9 +268,10 @@ function forexTotals(){
   const fxSettlements = DATA.paysettlements.filter(isFxSettlement);
   const bufferBooked = inrPayables.reduce((s,p)=>s+Number(p.bufferAmountUsd||0),0);
   const bufferRealized = fxSettlements.reduce((s,x)=>s+Number(x.allocatedBufferUsd||0),0);
-  const forexRealized = fxSettlements.reduce((s,x)=>s+Number(x.forexGainLoss||0),0); // +ve = net loss, -ve = net gain
-  const netPosition = bufferBooked - forexRealized;
-  return { bufferBooked, bufferRealized, forexRealized, netPosition, settlementCount: fxSettlements.length };
+  const forexRealized = fxSettlements.reduce((s,x)=>s+Number(x.forexGainLoss||0),0); // stored: +ve = loss, -ve = gain
+  const fxProfitRealized = -forexRealized; // flipped for display: +ve = profit, -ve = loss (this is the headline number)
+  const rawFxDifferenceRealized = fxSettlements.reduce((s,x)=>s+Number(x.fxDifference||0),0); // raw currency movement, before buffer
+  return { bufferBooked, bufferRealized, forexRealized, fxProfitRealized, rawFxDifferenceRealized, settlementCount: fxSettlements.length };
 }
 function monthlyForexSummary(){
   const map = {};
@@ -304,11 +304,30 @@ function invoiceStatus(inv){
   return 'Paid';
 }
 function payableStatus(p){
+  if(p.vendorType === 'INR'){
+    const remainingInr = remainingInrForPayable(p);
+    const totalInr = Number(p.inrAmount||0);
+    if(remainingInr <= 0.01) return 'Paid';
+    if(remainingInr < totalInr - 0.01) return 'Partially Paid';
+    return 'Unpaid';
+  }
   const paid = paidForPayable(p.id);
   const total = payableTotalUSD(p);
   if(paid <= 0) return 'Unpaid';
   if(paid < total - 0.004) return 'Partially Paid';
   return 'Paid';
+}
+// The USD figure to show as "outstanding" — for an INR vendor this is driven by the
+// remaining INR balance (not the USD paid-so-far, which will legitimately differ from
+// the booking estimate whenever there's forex gain/loss — that's not still-owed money).
+function payableOutstandingUSD(p){
+  if(p.vendorType === 'INR'){
+    const remainingInr = remainingInrForPayable(p);
+    if(remainingInr <= 0.01) return 0;
+    const rate = Number(p.bookingFxRate||0);
+    return rate>0 ? remainingInr/rate : 0;
+  }
+  return payableTotalUSD(p) - paidForPayable(p.id);
 }
 function statusBadge(status){
   const map = {'Paid':'badge-success','Partially Paid':'badge-warn','Unpaid':'badge-danger'};
@@ -328,7 +347,7 @@ function renderDashboard(main){
     }
   });
   DATA.payables.forEach(p=>{
-    const outstanding = payableTotalUSD(p) - paidForPayable(p.id);
+    const outstanding = payableOutstandingUSD(p);
     if(outstanding > 0.004) payUSD += outstanding;
   });
   const fx = forexTotals();
@@ -342,7 +361,7 @@ function renderDashboard(main){
       <div class="kpi-card"><div class="kpi-label">Receivable — USD</div><div class="kpi-value amount">$${fmtMoney(recUSD,'USD')}</div></div>
       <div class="kpi-card"><div class="kpi-label">Receivable — INR</div><div class="kpi-value amount">₹${fmtMoney(recINR,'INR')}</div></div>
       <div class="kpi-card"><div class="kpi-label">Payable Outstanding — USD</div><div class="kpi-value danger amount">$${fmtMoney(payUSD,'USD')}</div></div>
-      <div class="kpi-card"><div class="kpi-label">Net Forex Position</div><div class="kpi-value amount ${fx.netPosition>=0?'success':'danger'}">$${fmtMoney(Math.abs(fx.netPosition),'USD')} ${fx.netPosition>=0?'favorable':'unfavorable'}</div></div>
+      <div class="kpi-card"><div class="kpi-label">FX Profit/Loss (Realized)</div><div class="kpi-value amount ${fx.fxProfitRealized>=0?'success':'danger'}">${fx.fxProfitRealized>=0?'+':'-'}$${fmtMoney(Math.abs(fx.fxProfitRealized),'USD')}</div></div>
       <div class="kpi-card" style="cursor:pointer;border-color:${pnl.netProfit>=0?'var(--success)':'var(--danger)'};" onclick="navigate('pnl')">
         <div class="kpi-label">Net ${pnl.netProfit>=0?'Profit':'Loss'} (Since Inception) →</div>
         <div class="kpi-value amount ${pnl.netProfit>=0?'success':'danger'}">$${fmtMoney(Math.abs(pnl.netProfit),'USD')}</div>
@@ -765,8 +784,7 @@ function payableRows(){
   if(!DATA.payables.length) return `<tr class="empty-row"><td colspan="9">No payables yet.</td></tr>`;
   return [...DATA.payables].sort((a,b)=> new Date(b.createdAt)-new Date(a.createdAt)).map(p=>{
     const total = payableTotalUSD(p);
-    const paid = paidForPayable(p.id);
-    const outstanding = total - paid;
+    const outstanding = payableOutstandingUSD(p);
     return `<tr>
       <td class="mono">${escapeHtml(p.billNumber||'—')}</td>
       <td>${escapeHtml(vendorName(p.vendorId))}</td>
@@ -1064,30 +1082,40 @@ function renderForexReport(main){
   const fx = forexTotals();
   const monthly = monthlyForexSummary();
   const byVendor = vendorForexSummary();
+  const utilizationPct = fx.bufferRealized > 0.004 ? (fx.rawFxDifferenceRealized / fx.bufferRealized * 100) : null;
   main.innerHTML = `
     <div class="page-header">
-      <div><h2>Forex Report</h2><p>How your FX buffer compares to actual currency movement on INR-vendor settlements.</p></div>
+      <div><h2>Forex Report</h2><p>How much you've actually gained or lost from currency movement on settled INR-vendor bills, and whether your FX buffer is covering it.</p></div>
     </div>
+    <div class="kpi-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr));">
+      <div class="kpi-card" style="border-color:${fx.fxProfitRealized>=0?'var(--success)':'var(--danger)'};">
+        <div class="kpi-label">FX Profit/Loss (Realized)</div>
+        <div class="kpi-value amount ${fx.fxProfitRealized>=0?'success':'danger'}">${fx.fxProfitRealized>=0?'+':'-'}$${fmtMoney(Math.abs(fx.fxProfitRealized),'USD')}</div>
+      </div>
+    </div>
+    <p style="color:var(--muted);font-size:0.82rem;margin:-14px 0 20px;">
+      This is the sum of "Actual Forex Gain/Loss" across every settlement you've made against an INR-vendor bill — positive means currency movement (after your buffer) has worked in your favor so far; negative means it's cost you more than the buffer covered.
+    </p>
     <div class="kpi-grid">
-      <div class="kpi-card"><div class="kpi-label">Total Buffer Booked</div><div class="kpi-value amount">$${fmtMoney(fx.bufferBooked,'USD')}</div></div>
-      <div class="kpi-card"><div class="kpi-label">Total Buffer Realized</div><div class="kpi-value amount">$${fmtMoney(fx.bufferRealized,'USD')}</div></div>
-      <div class="kpi-card"><div class="kpi-label">Total Forex Gain/Loss (Realized)</div><div class="kpi-value amount ${fx.forexRealized>0?'danger':'success'}">${fx.forexRealized>0?'-':'+'}$${fmtMoney(Math.abs(fx.forexRealized),'USD')}</div></div>
-      <div class="kpi-card"><div class="kpi-label">Net Forex Position</div><div class="kpi-value amount ${fx.netPosition>=0?'success':'danger'}">$${fmtMoney(Math.abs(fx.netPosition),'USD')} ${fx.netPosition>=0?'favorable':'unfavorable'}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Total Buffer Booked (all bills)</div><div class="kpi-value amount">$${fmtMoney(fx.bufferBooked,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Total Buffer Realized (settled)</div><div class="kpi-value amount">$${fmtMoney(fx.bufferRealized,'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Raw FX Movement (settled, pre-buffer)</div><div class="kpi-value amount ${fx.rawFxDifferenceRealized>0?'danger':'success'}">${fx.rawFxDifferenceRealized>0?'+':'-'}$${fmtMoney(Math.abs(fx.rawFxDifferenceRealized),'USD')}</div></div>
+      <div class="kpi-card"><div class="kpi-label">Buffer Utilization</div><div class="kpi-value amount ${utilizationPct===null?'':(utilizationPct<=100?'success':'danger')}">${utilizationPct===null?'—':utilizationPct.toFixed(0)+'%'}</div></div>
     </div>
     <p style="color:var(--muted);font-size:0.82rem;margin-top:-14px;">
-      Net Forex Position = Total Buffer Booked − Total Forex Gain/Loss (Realized). Positive means your buffer has, on net, covered realized currency movement so far; negative means realized losses have exceeded the buffer collected.
+      Buffer Utilization = how much of your realized buffer got eaten up by actual currency movement. Under 100% means your 0.3% buffer is comfortably covering FX swings so far; over 100% means real movement is exceeding what the buffer collects, and the % is worth revisiting.
     </p>
 
     <div class="card">
       <div class="card-head"><h3>Monthly Forex Gain/Loss Summary</h3></div>
       <table>
-        <thead><tr><th>Month</th><th>Settlements</th><th>Buffer Allocated</th><th>Forex Gain/Loss</th></tr></thead>
+        <thead><tr><th>Month</th><th>Settlements</th><th>Buffer Allocated</th><th>FX Profit/Loss</th></tr></thead>
         <tbody>${monthly.length ? monthly.map(m=>`
           <tr>
             <td>${escapeHtml(m.month)}</td>
             <td>${m.count}</td>
             <td class="amount">$${fmtMoney(m.buffer,'USD')}</td>
-            <td class="amount" style="color:${m.gainLoss>0?'var(--danger)':'var(--success)'};">${m.gainLoss>0?'-':'+'}$${fmtMoney(Math.abs(m.gainLoss),'USD')}</td>
+            <td class="amount" style="color:${(-m.gainLoss)>=0?'var(--success)':'var(--danger)'};">${(-m.gainLoss)>=0?'+':'-'}$${fmtMoney(Math.abs(m.gainLoss),'USD')}</td>
           </tr>`).join('') : '<tr class="empty-row"><td colspan="4">No INR-vendor settlements recorded yet.</td></tr>'}</tbody>
       </table>
     </div>
@@ -1095,13 +1123,13 @@ function renderForexReport(main){
     <div class="card">
       <div class="card-head"><h3>Vendor-wise Forex Gain/Loss</h3></div>
       <table>
-        <thead><tr><th>Vendor</th><th>Settlements</th><th>Buffer Allocated</th><th>Forex Gain/Loss</th></tr></thead>
+        <thead><tr><th>Vendor</th><th>Settlements</th><th>Buffer Allocated</th><th>FX Profit/Loss</th></tr></thead>
         <tbody>${byVendor.length ? byVendor.map(v=>`
           <tr>
             <td>${escapeHtml(vendorName(v.vendorId))}</td>
             <td>${v.count}</td>
             <td class="amount">$${fmtMoney(v.buffer,'USD')}</td>
-            <td class="amount" style="color:${v.gainLoss>0?'var(--danger)':'var(--success)'};">${v.gainLoss>0?'-':'+'}$${fmtMoney(Math.abs(v.gainLoss),'USD')}</td>
+            <td class="amount" style="color:${(-v.gainLoss)>=0?'var(--success)':'var(--danger)'};">${(-v.gainLoss)>=0?'+':'-'}$${fmtMoney(Math.abs(v.gainLoss),'USD')}</td>
           </tr>`).join('') : '<tr class="empty-row"><td colspan="4">No INR-vendor settlements recorded yet.</td></tr>'}</tbody>
       </table>
     </div>
@@ -1391,7 +1419,12 @@ function setPnlRangeThisYear(){
 }
 
 /* ================= ADVANCES ================= */
+let ADV_FILTER_CUSTOMER = {customerId:'', from:'', to:''};
+let ADV_FILTER_VENDOR = {vendorId:'', from:'', to:''};
+
 function renderAdvances(main){
+  const customerOptions = DATA.customers.map(c=>`<option value="${c.id}" ${ADV_FILTER_CUSTOMER.customerId===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('');
+  const vendorOptions = DATA.vendors.map(v=>`<option value="${v.id}" ${ADV_FILTER_VENDOR.vendorId===v.id?'selected':''}>${escapeHtml(v.name)}</option>`).join('');
   main.innerHTML = `
     <div class="page-header">
       <div><h2>Advances</h2><p>Prepayments received from customers or sent to vendors, ahead of any specific invoice or bill — apply them later when you settle.</p></div>
@@ -1399,6 +1432,13 @@ function renderAdvances(main){
 
     <div class="card">
       <div class="card-head"><h3>Customer Advances (money received in advance)</h3><button class="btn btn-gold btn-sm" onclick="openCustomerAdvanceModal()">+ Record Advance</button></div>
+      <div style="padding:14px 20px;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;border-bottom:1px solid var(--border);">
+        <div class="form-group" style="margin-bottom:0;"><label>Customer</label><select id="caf-customer"><option value="">All customers</option>${customerOptions}</select></div>
+        <div class="form-group" style="margin-bottom:0;"><label>From</label><input type="date" id="caf-from" value="${ADV_FILTER_CUSTOMER.from}"></div>
+        <div class="form-group" style="margin-bottom:0;"><label>To</label><input type="date" id="caf-to" value="${ADV_FILTER_CUSTOMER.to}"></div>
+        <button class="btn btn-gold btn-sm" onclick="applyCustomerAdvanceFilter()">Apply</button>
+        ${(ADV_FILTER_CUSTOMER.customerId||ADV_FILTER_CUSTOMER.from||ADV_FILTER_CUSTOMER.to) ? `<button class="btn btn-sm" onclick="clearCustomerAdvanceFilter()">Clear</button>` : ''}
+      </div>
       <table>
         <thead><tr><th>Customer</th><th>Currency</th><th>Total Received</th><th>Applied</th><th>Available</th></tr></thead>
         <tbody>${customerAdvanceSummaryRows()}</tbody>
@@ -1414,6 +1454,13 @@ function renderAdvances(main){
 
     <div class="card">
       <div class="card-head"><h3>Vendor Advances (money you've paid in advance)</h3><button class="btn btn-gold btn-sm" onclick="openVendorAdvanceModal()">+ Record Advance</button></div>
+      <div style="padding:14px 20px;display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;border-bottom:1px solid var(--border);">
+        <div class="form-group" style="margin-bottom:0;"><label>Vendor</label><select id="vaf-vendor"><option value="">All vendors</option>${vendorOptions}</select></div>
+        <div class="form-group" style="margin-bottom:0;"><label>From</label><input type="date" id="vaf-from" value="${ADV_FILTER_VENDOR.from}"></div>
+        <div class="form-group" style="margin-bottom:0;"><label>To</label><input type="date" id="vaf-to" value="${ADV_FILTER_VENDOR.to}"></div>
+        <button class="btn btn-gold btn-sm" onclick="applyVendorAdvanceFilter()">Apply</button>
+        ${(ADV_FILTER_VENDOR.vendorId||ADV_FILTER_VENDOR.from||ADV_FILTER_VENDOR.to) ? `<button class="btn btn-sm" onclick="clearVendorAdvanceFilter()">Clear</button>` : ''}
+      </div>
       <table>
         <thead><tr><th>Vendor</th><th>Total Paid</th><th>Applied</th><th>Available</th></tr></thead>
         <tbody>${vendorAdvanceSummaryRows()}</tbody>
@@ -1428,15 +1475,51 @@ function renderAdvances(main){
     </div>
   `;
 }
+function applyCustomerAdvanceFilter(){
+  ADV_FILTER_CUSTOMER = {
+    customerId: document.getElementById('caf-customer').value,
+    from: document.getElementById('caf-from').value,
+    to: document.getElementById('caf-to').value
+  };
+  navigate('advances');
+}
+function clearCustomerAdvanceFilter(){
+  ADV_FILTER_CUSTOMER = {customerId:'', from:'', to:''};
+  navigate('advances');
+}
+function applyVendorAdvanceFilter(){
+  ADV_FILTER_VENDOR = {
+    vendorId: document.getElementById('vaf-vendor').value,
+    from: document.getElementById('vaf-from').value,
+    to: document.getElementById('vaf-to').value
+  };
+  navigate('advances');
+}
+function clearVendorAdvanceFilter(){
+  ADV_FILTER_VENDOR = {vendorId:'', from:'', to:''};
+  navigate('advances');
+}
+function matchesCustomerAdvanceFilter(a){
+  if(ADV_FILTER_CUSTOMER.customerId && a.customerId !== ADV_FILTER_CUSTOMER.customerId) return false;
+  if(ADV_FILTER_CUSTOMER.from && a.date < ADV_FILTER_CUSTOMER.from) return false;
+  if(ADV_FILTER_CUSTOMER.to && a.date > ADV_FILTER_CUSTOMER.to) return false;
+  return true;
+}
+function matchesVendorAdvanceFilter(a){
+  if(ADV_FILTER_VENDOR.vendorId && a.vendorId !== ADV_FILTER_VENDOR.vendorId) return false;
+  if(ADV_FILTER_VENDOR.from && a.date < ADV_FILTER_VENDOR.from) return false;
+  if(ADV_FILTER_VENDOR.to && a.date > ADV_FILTER_VENDOR.to) return false;
+  return true;
+}
 
 function customerAdvanceSummaryRows(){
   const map = {};
-  DATA.customerAdvances.forEach(a=>{
+  DATA.customerAdvances.filter(matchesCustomerAdvanceFilter).forEach(a=>{
     const key = a.customerId+'|'+a.currency;
     if(!map[key]) map[key] = {customerId:a.customerId, currency:a.currency};
   });
   const keys = Object.values(map);
-  if(!keys.length) return `<tr class="empty-row"><td colspan="5">No customer advances recorded yet.</td></tr>`;
+  if(!keys.length) return `<tr class="empty-row"><td colspan="5">No customer advances match this filter.</td></tr>`;
   return keys.map(k=>{
     const total = customerAdvanceTotal(k.customerId, k.currency);
     const applied = customerAdvanceApplied(k.customerId, k.currency);
@@ -1451,8 +1534,9 @@ function customerAdvanceSummaryRows(){
   }).join('');
 }
 function customerAdvanceRows(){
-  if(!DATA.customerAdvances.length) return `<tr class="empty-row"><td colspan="7">No entries yet.</td></tr>`;
-  return [...DATA.customerAdvances].sort((a,b)=> new Date(b.date)-new Date(a.date)).map(a=>`
+  const filtered = DATA.customerAdvances.filter(matchesCustomerAdvanceFilter);
+  if(!filtered.length) return `<tr class="empty-row"><td colspan="7">No entries match this filter.</td></tr>`;
+  return [...filtered].sort((a,b)=> new Date(b.date)-new Date(a.date)).map(a=>`
     <tr>
       <td>${fmtDate(a.date)}</td>
       <td>${escapeHtml(customerName(a.customerId))}</td>
@@ -1506,8 +1590,8 @@ function openCustomerAdvanceModal(){
 }
 
 function vendorAdvanceSummaryRows(){
-  const vendorIds = [...new Set(DATA.vendorAdvances.map(a=>a.vendorId))];
-  if(!vendorIds.length) return `<tr class="empty-row"><td colspan="4">No vendor advances recorded yet.</td></tr>`;
+  const vendorIds = [...new Set(DATA.vendorAdvances.filter(matchesVendorAdvanceFilter).map(a=>a.vendorId))];
+  if(!vendorIds.length) return `<tr class="empty-row"><td colspan="4">No vendor advances match this filter.</td></tr>`;
   return vendorIds.map(vId=>{
     const total = vendorAdvanceTotal(vId);
     const applied = vendorAdvanceApplied(vId);
@@ -1521,8 +1605,9 @@ function vendorAdvanceSummaryRows(){
   }).join('');
 }
 function vendorAdvanceRows(){
-  if(!DATA.vendorAdvances.length) return `<tr class="empty-row"><td colspan="8">No entries yet.</td></tr>`;
-  return [...DATA.vendorAdvances].sort((a,b)=> new Date(b.date)-new Date(a.date)).map(a=>{
+  const filtered = DATA.vendorAdvances.filter(matchesVendorAdvanceFilter);
+  if(!filtered.length) return `<tr class="empty-row"><td colspan="8">No entries match this filter.</td></tr>`;
+  return [...filtered].sort((a,b)=> new Date(b.date)-new Date(a.date)).map(a=>{
     const remaining = vendorAdvanceRemaining(a.id);
     return `<tr>
       <td>${fmtDate(a.date)}</td>
