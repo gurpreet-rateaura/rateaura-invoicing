@@ -190,6 +190,7 @@ function navigate(view){
     expenses: renderExpenses,
     pnl: renderProfitLoss,
     advances: renderAdvances,
+    ledger: renderLedger,
     settings: renderSettings
   };
   main.innerHTML = '';
@@ -954,127 +955,162 @@ function openPaySettleModalUSD(p){
     }}
   ]);
 }
+let SETTLE_LINES = [];
 function openPaySettleModalINR(p){
   const remainingInr = remainingInrForPayable(p);
   const paidUsd = paidForPayable(p.id);
   const outstandingUsd = payableTotalUSD(p) - paidUsd;
   const history = DATA.paysettlements.filter(s=>s.payableId===p.id);
-  const advanceOptions = vendorAdvancesForDropdown(p.vendorId);
+  SETTLE_LINES = [{source:'', inr: remainingInr>0?Number(remainingInr.toFixed(2)):0, fx:''}];
   const body = `
     <p style="margin-top:0;color:var(--muted);font-size:0.9rem;">
       Bill <strong>${escapeHtml(p.billNumber||'—')}</strong> — Remaining <strong>₹${fmtMoney(remainingInr,'INR')}</strong>
       (≈ <strong>$${fmtMoney(outstandingUsd,'USD')}</strong> at booking rate)
     </p>
-    ${advanceOptions.length ? `
-    <div class="form-group">
-      <label>Pay From</label>
-      <select id="ps-source" onchange="onSettleSourceChange('${p.id}')">
-        <option value="">New payment (enter today's FX rate below)</option>
-        ${advanceOptions.map(a=>`<option value="${a.id}">Advance from ${fmtDate(a.date)} — $${fmtMoney(vendorAdvanceRemaining(a.id),'USD')} remaining @ ${Number(a.fxRateAtPayment).toFixed(4)}</option>`).join('')}
-      </select>
-    </div>` : ''}
-    <div class="form-row">
-      <div class="form-group"><label>INR Amount Being Settled</label><input type="number" id="ps-inr" step="0.01" value="${remainingInr>0?remainingInr.toFixed(2):''}" oninput="updateSettlePreview('${p.id}')"></div>
-      <div class="form-group"><label>Payment Date</label><input type="date" id="ps-date" value="${todayISO()}"></div>
+    <div class="form-group"><label>Payment Date</label><input type="date" id="ps-date" value="${todayISO()}"></div>
+    <div class="section-title" style="margin-top:4px;">Allocation — split across advance batches and/or a new payment if needed</div>
+    <table class="items-table">
+      <thead><tr><th style="width:38%">Pay From</th><th>INR Amount</th><th>FX Rate</th><th>USD</th><th></th></tr></thead>
+      <tbody id="settle-lines-body"></tbody>
+    </table>
+    <button class="btn btn-sm" onclick="addSettleLine('${p.id}')">+ Add line</button>
+    <div class="totals-box">
+      <div>INR Allocated: <span class="amount" id="settle-inr-total">0.00</span> / ₹${fmtMoney(remainingInr,'INR')} remaining</div>
+      <div>Total USD: <span class="amount grand" id="settle-usd-total">0.00</span></div>
     </div>
-    <div class="form-group"><label id="ps-fxrate-label">Today's FX Rate (INR per USD)</label><input type="number" id="ps-fxrate" step="0.0001" oninput="updateSettlePreview('${p.id}')"></div>
-    <div class="card" style="background:var(--paper);box-shadow:none;margin:10px 0;">
+    <div class="card" style="background:var(--paper);box-shadow:none;margin:14px 0;">
       <div style="padding:14px 18px;font-size:0.88rem;">
-        <div class="settle-row"><span>USD Remitted</span><span class="amount" id="prev-usdpaid">$0.00</span></div>
-        <div class="settle-row"><span>Allocated Actual USD Buying</span><span class="amount" id="prev-allocactual">$0.00</span></div>
-        <div class="settle-row"><span>Allocated Buffer</span><span class="amount" id="prev-allocbuffer">$0.00</span></div>
-        <div class="settle-row"><span>FX Difference</span><span class="amount" id="prev-fxdiff">$0.00</span></div>
-        <div class="settle-row" style="font-weight:600;color:var(--ink);"><span>Actual Forex Gain/Loss</span><span class="amount" id="prev-forexgl">$0.00</span></div>
+        <div class="settle-row" style="font-weight:600;color:var(--ink);"><span>Combined Actual Forex Gain/Loss</span><span class="amount" id="prev-forexgl">$0.00</span></div>
       </div>
     </div>
-    <div class="form-group"><label>Method</label><input type="text" id="ps-method"></div>
+    <div class="form-group"><label>Method (for any new-payment lines)</label><input type="text" id="ps-method"></div>
     <div class="form-group full"><label>Note</label><input type="text" id="ps-note"></div>
     <div class="settle-list">
       <div class="section-title" style="margin:0 0 8px;">Settlement History</div>
       ${history.length ? history.map(h=>{
         const gl = Number(h.forexGainLoss||0);
-        return `<div class="settle-row"><span>${fmtDate(h.date)} — ₹${fmtMoney(h.inrAmountSettled,'INR')} @ ${h.paymentFxRate}${h.source==='advance'?' <em>(from advance)</em>':''}</span><span class="amount" style="color:${gl>0?'var(--danger)':'var(--success)'};">${gl>0?'-':'+'}$${fmtMoney(Math.abs(gl),'USD')}</span></div>`;
+        return `<div class="settle-row"><span>${fmtDate(h.date)} — ₹${fmtMoney(h.inrAmountSettled,'INR')} @ ${h.paymentFxRate}${h.source==='advance'?' <em>(from advance)</em>':''}</span><span class="amount" style="color:${(-gl)>=0?'var(--success)':'var(--danger)'};">${(-gl)>=0?'+':'-'}$${fmtMoney(Math.abs(gl),'USD')}</span></div>`;
       }).join('') : '<div class="settle-row"><span>No settlements yet.</span></div>'}
     </div>
   `;
   openModal('Settle Bill — INR Vendor (FX Tracked)', body, [
     {label:'Close', cls:'btn', onClick:closeModal},
-    {label:'Record Payment', cls:'btn btn-gold', onClick: async ()=>{
-      const inrAmountSettled = parseFloat(document.getElementById('ps-inr').value)||0;
-      const paymentFxRate = parseFloat(document.getElementById('ps-fxrate').value)||0;
-      if(inrAmountSettled<=0 || paymentFxRate<=0){ alert('Enter a valid INR amount and FX rate.'); return; }
-      const inrAmount = Number(p.inrAmount||0);
-      const share = inrAmount>0 ? (inrAmountSettled/inrAmount) : 0;
-      const allocatedActualUsdBuying = Number(p.actualUsdBuying||0) * share;
-      const allocatedBufferUsd = Number(p.bufferAmountUsd||0) * share;
-      const paymentAmountUsd = inrAmountSettled / paymentFxRate;
-      const fxDifference = paymentAmountUsd - allocatedActualUsdBuying;
-      const forexGainLoss = fxDifference - allocatedBufferUsd;
-      const advanceId = document.getElementById('ps-source')?.value || '';
-      if(advanceId){
-        const remaining = vendorAdvanceRemaining(advanceId);
-        if(paymentAmountUsd > remaining + 0.005){ alert('This settlement (' + fmtMoney(paymentAmountUsd,'USD') + ' USD) exceeds the remaining balance on that advance ($' + fmtMoney(remaining,'USD') + ').'); return; }
-      }
-      await apiPost('addPaySettlement', {
-        payableId: p.id,
-        date: document.getElementById('ps-date').value,
-        amount: paymentAmountUsd,
-        inrAmountSettled, paymentFxRate,
-        allocatedActualUsdBuying, allocatedBufferUsd, fxDifference, forexGainLoss,
-        method: advanceId ? 'Advance Balance' : document.getElementById('ps-method').value,
-        note: document.getElementById('ps-note').value,
-        source: advanceId ? 'advance' : '',
-        advanceId: advanceId || ''
-      });
-      await reloadData();
-      closeModal();
-      navigate('payables');
-    }}
-  ]);
-  updateSettlePreview(p.id);
+    {label:'Record Payment', cls:'btn btn-gold', onClick: async ()=>{ await saveSettleLines(p); }}
+  ], true);
+  renderSettleLines(p.id);
 }
-function onSettleSourceChange(payableId){
-  const sel = document.getElementById('ps-source');
-  const fxInput = document.getElementById('ps-fxrate');
-  const label = document.getElementById('ps-fxrate-label');
-  const advanceId = sel ? sel.value : '';
+function addSettleLine(payableId){
+  SETTLE_LINES.push({source:'', inr:0, fx:''});
+  renderSettleLines(payableId);
+}
+function removeSettleLine(i, payableId){
+  SETTLE_LINES.splice(i,1);
+  renderSettleLines(payableId);
+}
+function renderSettleLines(payableId){
+  const p = DATA.payables.find(x=>x.id===payableId);
+  const advanceOptions = vendorAdvancesForDropdown(p.vendorId);
+  const tbody = document.getElementById('settle-lines-body');
+  tbody.innerHTML = SETTLE_LINES.map((line,i)=>{
+    const isAdvance = !!line.source;
+    return `<tr>
+      <td>
+        <select onchange="onSettleLineSourceChange(${i},'${payableId}')" id="sl-source-${i}">
+          <option value="" ${!isAdvance?'selected':''}>New payment</option>
+          ${advanceOptions.map(a=>`<option value="${a.id}" ${line.source===a.id?'selected':''}>${fmtDate(a.date)} — $${fmtMoney(vendorAdvanceRemaining(a.id),'USD')} @ ${Number(a.fxRateAtPayment).toFixed(4)}</option>`).join('')}
+        </select>
+      </td>
+      <td><input type="number" step="0.01" value="${line.inr}" oninput="SETTLE_LINES[${i}].inr=parseFloat(this.value)||0;updateSettleLineTotals('${payableId}')"></td>
+      <td><input type="number" step="0.0001" value="${line.fx}" ${isAdvance?'readonly style="background:#EEEDE8;"':''} id="sl-fx-${i}" oninput="SETTLE_LINES[${i}].fx=parseFloat(this.value)||0;updateSettleLineTotals('${payableId}')"></td>
+      <td class="amount" id="sl-usd-${i}">0.00</td>
+      <td>${SETTLE_LINES.length>1?`<button class="remove-item" onclick="removeSettleLine(${i},'${payableId}')">✕</button>`:''}</td>
+    </tr>`;
+  }).join('');
+  updateSettleLineTotals(payableId);
+}
+function onSettleLineSourceChange(i, payableId){
+  const sel = document.getElementById('sl-source-'+i);
+  const advanceId = sel.value;
+  SETTLE_LINES[i].source = advanceId;
   if(advanceId){
     const adv = DATA.vendorAdvances.find(a=>a.id===advanceId);
-    if(adv){
-      fxInput.value = adv.fxRateAtPayment;
-      fxInput.readOnly = true;
-      fxInput.style.background = '#EEEDE8';
-      if(label) label.textContent = 'FX Rate (locked to this advance batch)';
-    }
-  }else{
-    fxInput.readOnly = false;
-    fxInput.style.background = '';
-    if(label) label.textContent = "Today's FX Rate (INR per USD)";
+    SETTLE_LINES[i].fx = adv ? Number(adv.fxRateAtPayment) : '';
   }
-  updateSettlePreview(payableId);
+  renderSettleLines(payableId);
 }
-function updateSettlePreview(payableId){
+function updateSettleLineTotals(payableId){
   const p = DATA.payables.find(x=>x.id===payableId);
-  if(!p) return;
-  const inrAmountSettled = parseFloat(document.getElementById('ps-inr')?.value)||0;
-  const paymentFxRate = parseFloat(document.getElementById('ps-fxrate')?.value)||0;
   const inrAmount = Number(p.inrAmount||0);
-  const share = inrAmount>0 ? (inrAmountSettled/inrAmount) : 0;
-  const allocatedActualUsdBuying = Number(p.actualUsdBuying||0) * share;
-  const allocatedBufferUsd = Number(p.bufferAmountUsd||0) * share;
-  const paymentAmountUsd = paymentFxRate>0 ? inrAmountSettled/paymentFxRate : 0;
-  const fxDifference = paymentAmountUsd - allocatedActualUsdBuying;
-  const forexGainLoss = fxDifference - allocatedBufferUsd;
-  const set = (id,val)=>{ const el=document.getElementById(id); if(el) el.textContent = val; };
-  set('prev-usdpaid', '$'+fmtMoney(paymentAmountUsd,'USD'));
-  set('prev-allocactual', '$'+fmtMoney(allocatedActualUsdBuying,'USD'));
-  set('prev-allocbuffer', '$'+fmtMoney(allocatedBufferUsd,'USD'));
-  set('prev-fxdiff', '$'+fmtMoney(fxDifference,'USD'));
+  let inrTotal = 0, usdTotal = 0, glTotal = 0;
+  SETTLE_LINES.forEach((line,i)=>{
+    const share = inrAmount>0 ? (line.inr/inrAmount) : 0;
+    const allocActual = Number(p.actualUsdBuying||0) * share;
+    const allocBuffer = Number(p.bufferAmountUsd||0) * share;
+    const usd = line.fx>0 ? line.inr/line.fx : 0;
+    const fxDiff = usd - allocActual;
+    const gl = fxDiff - allocBuffer;
+    inrTotal += line.inr||0;
+    usdTotal += usd;
+    glTotal += gl;
+    const cell = document.getElementById('sl-usd-'+i);
+    if(cell) cell.textContent = fmtMoney(usd,'USD');
+  });
+  const inrTotalEl = document.getElementById('settle-inr-total'); if(inrTotalEl) inrTotalEl.textContent = fmtMoney(inrTotal,'INR');
+  const usdTotalEl = document.getElementById('settle-usd-total'); if(usdTotalEl) usdTotalEl.textContent = fmtMoney(usdTotal,'USD');
   const glEl = document.getElementById('prev-forexgl');
   if(glEl){
-    glEl.textContent = (forexGainLoss>0?'Loss ':'Gain ') + '$'+fmtMoney(Math.abs(forexGainLoss),'USD');
-    glEl.style.color = forexGainLoss>0 ? 'var(--danger)' : 'var(--success)';
+    const profit = -glTotal;
+    glEl.textContent = (profit>=0?'+':'-') + '$' + fmtMoney(Math.abs(profit),'USD');
+    glEl.style.color = profit>=0 ? 'var(--success)' : 'var(--danger)';
   }
+}
+async function saveSettleLines(p){
+  const inrAmount = Number(p.inrAmount||0);
+  const date = document.getElementById('ps-date').value;
+  const method = document.getElementById('ps-method').value;
+  const note = document.getElementById('ps-note').value;
+  const usedByAdvance = {}; // tracks cumulative use within this save, across lines drawing the same batch
+
+  for(const line of SETTLE_LINES){
+    if(!(line.inr > 0)){ continue; }
+    if(!(line.fx > 0)){ alert('Enter an FX rate for every allocation line.'); return; }
+    if(line.source){
+      const remaining = vendorAdvanceRemaining(line.source) - (usedByAdvance[line.source]||0);
+      const share = inrAmount>0 ? (line.inr/inrAmount) : 0;
+      const usdForLine = line.inr/line.fx;
+      if(usdForLine > remaining + 0.005){
+        alert('One of the allocation lines ($' + fmtMoney(usdForLine,'USD') + ') exceeds the remaining balance on that advance batch ($' + fmtMoney(remaining,'USD') + ').');
+        return;
+      }
+    }
+  }
+
+  const validLines = SETTLE_LINES.filter(l=>l.inr>0);
+  if(!validLines.length){ alert('Enter at least one allocation with an INR amount.'); return; }
+  const totalInr = validLines.reduce((s,l)=>s+l.inr,0);
+  if(totalInr > remainingInrForPayable(p) + 0.5){
+    if(!confirm('The total allocated (₹' + fmtMoney(totalInr,'INR') + ') is more than what remains on this bill. Continue anyway?')) return;
+  }
+
+  for(const line of validLines){
+    const share = inrAmount>0 ? (line.inr/inrAmount) : 0;
+    const allocatedActualUsdBuying = Number(p.actualUsdBuying||0) * share;
+    const allocatedBufferUsd = Number(p.bufferAmountUsd||0) * share;
+    const paymentAmountUsd = line.inr/line.fx;
+    const fxDifference = paymentAmountUsd - allocatedActualUsdBuying;
+    const forexGainLoss = fxDifference - allocatedBufferUsd;
+    usedByAdvance[line.source] = (usedByAdvance[line.source]||0) + paymentAmountUsd;
+    await apiPost('addPaySettlement', {
+      payableId: p.id, date, amount: paymentAmountUsd,
+      inrAmountSettled: line.inr, paymentFxRate: line.fx,
+      allocatedActualUsdBuying, allocatedBufferUsd, fxDifference, forexGainLoss,
+      method: line.source ? 'Advance Balance' : method,
+      note, source: line.source ? 'advance' : '', advanceId: line.source || ''
+    });
+  }
+  await reloadData();
+  closeModal();
+  navigate('payables');
 }
 
 /* ================= FOREX REPORT ================= */
@@ -1674,6 +1710,248 @@ function openVendorAdvanceModal(){
       navigate('advances');
     }}
   ]);
+}
+
+/* ================= LEDGER ================= */
+let LEDGER_STATE = null;
+
+function buildVendorLedgerEntries(vendorId){
+  const entries = [];
+  DATA.payables.filter(p=>p.vendorId===vendorId).forEach(p=>{
+    entries.push({
+      date: p.billDate || p.createdAt,
+      particulars: 'Bill' + (p.billNumber?(' — '+p.billNumber):'') + (p.remarks?(' — '+p.remarks):''),
+      vchType: 'Bill', vchNo: p.billNumber || '—',
+      debit: 0, credit: payableTotalUSD(p)
+    });
+  });
+  DATA.paysettlements.forEach(s=>{
+    if(s.source === 'advance') return; // already represented by the advance-paid entry
+    const p = DATA.payables.find(x=>x.id===s.payableId);
+    if(!p || p.vendorId!==vendorId) return;
+    entries.push({
+      date: s.date,
+      particulars: 'Payment' + (p.billNumber?(' — Bill '+p.billNumber):'') + (s.method?(' — '+s.method):'') + (s.note?(' — '+s.note):''),
+      vchType: 'Payment', vchNo: p.billNumber || '—',
+      debit: Number(s.amount||0), credit: 0
+    });
+  });
+  DATA.vendorAdvances.filter(a=>a.vendorId===vendorId).forEach(a=>{
+    entries.push({
+      date: a.date,
+      particulars: 'Advance Paid' + (a.method?(' — '+a.method):'') + (a.note?(' — '+a.note):''),
+      vchType: 'Advance', vchNo: '—',
+      debit: Number(a.amount||0), credit: 0
+    });
+  });
+  return entries.sort((a,b)=> new Date(a.date)-new Date(b.date));
+}
+
+function buildCustomerLedgerEntries(customerId, currency){
+  const entries = [];
+  DATA.invoices.filter(i=>i.customerId===customerId && i.currency===currency).forEach(inv=>{
+    entries.push({
+      date: inv.issueDate,
+      particulars: 'Invoice' + (inv.notes?(' — '+inv.notes):''),
+      vchType: 'Invoice', vchNo: inv.invoiceNumber,
+      debit: Number(inv.total||0), credit: 0
+    });
+  });
+  DATA.payments.forEach(p=>{
+    if(p.source === 'advance') return;
+    const inv = DATA.invoices.find(i=>i.id===p.invoiceId);
+    if(!inv || inv.customerId!==customerId || inv.currency!==currency) return;
+    entries.push({
+      date: p.date,
+      particulars: 'Payment Received' + (' — '+inv.invoiceNumber) + (p.method?(' — '+p.method):'') + (p.note?(' — '+p.note):''),
+      vchType: 'Receipt', vchNo: inv.invoiceNumber,
+      debit: 0, credit: Number(p.amount||0)
+    });
+  });
+  DATA.customerAdvances.filter(a=>a.customerId===customerId && a.currency===currency).forEach(a=>{
+    entries.push({
+      date: a.date,
+      particulars: 'Advance Received' + (a.method?(' — '+a.method):'') + (a.note?(' — '+a.note):''),
+      vchType: 'Advance', vchNo: '—',
+      debit: 0, credit: Number(a.amount||0)
+    });
+  });
+  return entries.sort((a,b)=> new Date(a.date)-new Date(b.date));
+}
+
+// balanceSign: +1 for a customer/debtor ledger (balance = cumulative debit − credit,
+// i.e. what they owe us) | -1 for a vendor/creditor ledger (balance = cumulative
+// credit − debit, i.e. what we owe them)
+function computeLedger(entries, from, to, balanceSign){
+  let opening = 0;
+  entries.forEach(e=>{ if(e.date < from) opening += balanceSign*(e.debit - e.credit); });
+  let running = opening;
+  const rows = entries.filter(e=> e.date>=from && e.date<=to).map(e=>{
+    running += balanceSign*(e.debit - e.credit);
+    return Object.assign({}, e, {balance: running});
+  });
+  const totalDebit = rows.reduce((s,r)=>s+r.debit,0);
+  const totalCredit = rows.reduce((s,r)=>s+r.credit,0);
+  return { opening, rows, totalDebit, totalCredit, closing: running };
+}
+
+function renderLedger(main){
+  main.innerHTML = `
+    <div class="page-header">
+      <div><h2>Ledger</h2><p>A statement of account for any customer or vendor — every debit, credit, and running balance, ready to share.</p></div>
+    </div>
+    <div class="card">
+      <div style="padding:16px 20px;display:flex;gap:14px;align-items:flex-end;flex-wrap:wrap;">
+        <div class="form-group" style="margin-bottom:0;"><label>Party Type</label>
+          <select id="ldg-type" onchange="onLedgerTypeChange()">
+            <option value="customer">Customer</option>
+            <option value="vendor">Vendor</option>
+          </select>
+        </div>
+        <div class="form-group" style="margin-bottom:0;"><label>Party</label><select id="ldg-party"></select></div>
+        <div class="form-group" id="ldg-currency-group" style="margin-bottom:0;"><label>Currency</label>
+          <select id="ldg-currency"><option value="USD">USD</option><option value="INR">INR</option></select>
+        </div>
+        <div class="form-group" style="margin-bottom:0;"><label>From</label><input type="date" id="ldg-from" value="${DATA.config.businessStartDate||'2026-02-01'}"></div>
+        <div class="form-group" style="margin-bottom:0;"><label>To</label><input type="date" id="ldg-to" value="${todayISO()}"></div>
+        <button class="btn btn-gold btn-sm" onclick="generateLedger()">Generate</button>
+      </div>
+    </div>
+    <div id="ledger-output"></div>
+  `;
+  onLedgerTypeChange();
+}
+function onLedgerTypeChange(){
+  const type = document.getElementById('ldg-type').value;
+  const partySelect = document.getElementById('ldg-party');
+  const options = type==='customer'
+    ? DATA.customers.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('')
+    : DATA.vendors.map(v=>`<option value="${v.id}">${escapeHtml(v.name)}</option>`).join('');
+  partySelect.innerHTML = options || '<option value="">None yet</option>';
+  document.getElementById('ldg-currency-group').style.display = type==='customer' ? 'block' : 'none';
+}
+function generateLedger(){
+  const type = document.getElementById('ldg-type').value;
+  const partyId = document.getElementById('ldg-party').value;
+  const from = document.getElementById('ldg-from').value;
+  const to = document.getElementById('ldg-to').value;
+  if(!partyId){ document.getElementById('ledger-output').innerHTML = `<p style="color:var(--muted);">Add a ${type} first.</p>`; return; }
+
+  let entries, balanceSign, currency, partyName;
+  if(type==='customer'){
+    currency = document.getElementById('ldg-currency').value;
+    entries = buildCustomerLedgerEntries(partyId, currency);
+    balanceSign = 1;
+    partyName = customerName(partyId);
+  }else{
+    currency = 'USD';
+    entries = buildVendorLedgerEntries(partyId);
+    balanceSign = -1;
+    partyName = vendorName(partyId);
+  }
+  const ledger = computeLedger(entries, from, to, balanceSign);
+  LEDGER_STATE = { type, partyId, partyName, currency, from, to, ledger };
+
+  const sym = symbolFor(currency);
+  const balanceLabel = type==='customer' ? 'owes you' : 'you owe';
+  document.getElementById('ledger-output').innerHTML = `
+    <div class="card">
+      <div class="card-head">
+        <h3>${escapeHtml(partyName)} — ${fmtDate(from)} to ${fmtDate(to)}</h3>
+        <button class="btn btn-sm" onclick="downloadLedgerPDF()">Download PDF</button>
+      </div>
+      <table>
+        <thead><tr><th>Date</th><th>Particulars</th><th>Vch Type</th><th>Vch No.</th><th>Debit</th><th>Credit</th><th>Balance</th></tr></thead>
+        <tbody>
+          <tr style="background:var(--paper);">
+            <td colspan="6" style="font-style:italic;color:var(--muted);">Opening Balance</td>
+            <td class="amount" style="font-weight:600;">${sym}${fmtMoney(Math.abs(ledger.opening),currency)} ${ledger.opening>=0?balanceLabel:'(credit)'}</td>
+          </tr>
+          ${ledger.rows.length ? ledger.rows.map(r=>`
+            <tr>
+              <td>${fmtDate(r.date)}</td>
+              <td>${escapeHtml(r.particulars)}</td>
+              <td>${escapeHtml(r.vchType)}</td>
+              <td class="mono">${escapeHtml(r.vchNo)}</td>
+              <td class="amount">${r.debit>0.004?sym+fmtMoney(r.debit,currency):''}</td>
+              <td class="amount">${r.credit>0.004?sym+fmtMoney(r.credit,currency):''}</td>
+              <td class="amount">${sym}${fmtMoney(Math.abs(r.balance),currency)}</td>
+            </tr>`).join('') : '<tr class="empty-row"><td colspan="7">No transactions in this range.</td></tr>'}
+          <tr style="border-top:2px solid var(--ink);font-weight:600;">
+            <td colspan="4">Totals / Closing Balance</td>
+            <td class="amount">${sym}${fmtMoney(ledger.totalDebit,currency)}</td>
+            <td class="amount">${sym}${fmtMoney(ledger.totalCredit,currency)}</td>
+            <td class="amount">${sym}${fmtMoney(Math.abs(ledger.closing),currency)} ${ledger.closing>=0?balanceLabel:'(credit)'}</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function downloadLedgerPDF(){
+  if(!LEDGER_STATE) return;
+  const { partyName, currency, from, to, ledger, type } = LEDGER_STATE;
+  const c = DATA.config;
+  const sym = symbolFor(currency);
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({unit:'pt', format:'a4'});
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const margin = 48;
+  const brass = [184,134,59]; const ink = [20,33,61]; const muted = [107,114,128];
+
+  let y = 56;
+  let logoOk = false;
+  if(c.logoBase64){
+    try{
+      const dims = doc.getImageProperties(c.logoBase64);
+      const boxW = 110, boxH = 50;
+      let w = boxW, h = boxW * (dims.height/dims.width);
+      if(h > boxH){ h = boxH; w = boxH * (dims.width/dims.height); }
+      doc.addImage(c.logoBase64, 'PNG', margin, y-22, w, h, undefined, 'FAST');
+      logoOk = true;
+    }catch(e){}
+  }
+  doc.setFont('helvetica','bold'); doc.setFontSize(14); doc.setTextColor(...ink);
+  doc.text(c.companyName || 'Company Name', margin, y + (logoOk?44:0));
+  let leftY = y + (logoOk?60:16);
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...muted);
+  [c.addressLine1, c.addressLine2, [c.city,c.state,c.postalCode].filter(Boolean).join(', '), c.country].filter(Boolean).forEach(line=>{ doc.text(line, margin, leftY); leftY += 12; });
+
+  doc.setFont('helvetica','bold'); doc.setFontSize(20); doc.setTextColor(...ink);
+  doc.text('LEDGER STATEMENT', pageWidth-margin, 60, {align:'right'});
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...muted);
+  doc.text((type==='customer'?'Customer: ':'Vendor: ') + partyName, pageWidth-margin, 80, {align:'right'});
+  doc.text(fmtDate(from) + ' to ' + fmtDate(to), pageWidth-margin, 94, {align:'right'});
+
+  const ruleY = Math.max(leftY, 120) + 12;
+  doc.setDrawColor(...brass); doc.setLineWidth(1.4);
+  doc.line(margin, ruleY, pageWidth-margin, ruleY);
+
+  const balanceLabel = type==='customer' ? 'Dr' : 'Cr';
+  const rows = [
+    ['', 'Opening Balance', '', '', '', '', sym+fmtMoney(Math.abs(ledger.opening),currency)],
+    ...ledger.rows.map(r=>[fmtDate(r.date), r.particulars, r.vchType, r.vchNo, r.debit>0.004?sym+fmtMoney(r.debit,currency):'', r.credit>0.004?sym+fmtMoney(r.credit,currency):'', sym+fmtMoney(Math.abs(r.balance),currency)])
+  ];
+
+  doc.autoTable({
+    startY: ruleY + 18,
+    margin: {left: margin, right: margin},
+    head: [['Date','Particulars','Vch Type','Vch No.','Debit','Credit','Balance']],
+    body: rows,
+    theme: 'plain',
+    styles: { font:'helvetica', fontSize:8.5, textColor: ink, cellPadding:{top:6,bottom:6,left:4,right:4} },
+    headStyles: { textColor: muted, fontStyle:'bold', fontSize:7.5, halign:'left' },
+    columnStyles: { 4:{halign:'right'}, 5:{halign:'right'}, 6:{halign:'right'} },
+    didParseCell: function(data){
+      if(data.section==='head'){ data.cell.styles.lineWidth = {bottom:1}; data.cell.styles.lineColor = brass; }
+    },
+    tableLineColor: [228,225,217], tableLineWidth: 0.3,
+    foot: [['','Totals','','', sym+fmtMoney(ledger.totalDebit,currency), sym+fmtMoney(ledger.totalCredit,currency), sym+fmtMoney(Math.abs(ledger.closing),currency)+' '+balanceLabel]],
+    footStyles: { fontStyle:'bold', textColor: ink, fillColor: [246,245,241], fontSize:8.5 },
+  });
+
+  doc.save('Ledger — ' + partyName + ' — ' + from + ' to ' + to + '.pdf');
 }
 
 /* ================= SETTINGS (Company Master) ================= */
