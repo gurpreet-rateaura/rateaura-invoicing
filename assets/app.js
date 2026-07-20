@@ -1716,13 +1716,16 @@ function openVendorAdvanceModal(){
 let LEDGER_STATE = null;
 
 function buildVendorLedgerEntries(vendorId){
+  const vendor = DATA.vendors.find(v=>v.id===vendorId);
+  const isInr = vendor && vendor.vendorType === 'INR';
+  const currency = isInr ? 'INR' : 'USD';
   const entries = [];
   DATA.payables.filter(p=>p.vendorId===vendorId).forEach(p=>{
     entries.push({
       date: p.billDate || p.createdAt,
-      particulars: 'Bill' + (p.billNumber?(' — '+p.billNumber):'') + (p.remarks?(' — '+p.remarks):''),
+      particulars: 'Bill' + (p.remarks?(' — '+p.remarks):''),
       vchType: 'Bill', vchNo: p.billNumber || '—',
-      debit: 0, credit: payableTotalUSD(p)
+      debit: 0, credit: isInr ? Number(p.inrAmount||0) : payableTotalUSD(p)
     });
   });
   DATA.paysettlements.forEach(s=>{
@@ -1733,18 +1736,19 @@ function buildVendorLedgerEntries(vendorId){
       date: s.date,
       particulars: 'Payment' + (p.billNumber?(' — Bill '+p.billNumber):'') + (s.method?(' — '+s.method):'') + (s.note?(' — '+s.note):''),
       vchType: 'Payment', vchNo: p.billNumber || '—',
-      debit: Number(s.amount||0), credit: 0
+      debit: isInr ? Number(s.inrAmountSettled||0) : Number(s.amount||0), credit: 0
     });
   });
   DATA.vendorAdvances.filter(a=>a.vendorId===vendorId).forEach(a=>{
+    const inrEquivalent = a.fxRateAtPayment ? Number(a.amount||0) * Number(a.fxRateAtPayment) : null;
     entries.push({
       date: a.date,
       particulars: 'Advance Paid' + (a.method?(' — '+a.method):'') + (a.note?(' — '+a.note):''),
       vchType: 'Advance', vchNo: '—',
-      debit: Number(a.amount||0), credit: 0
+      debit: isInr ? (inrEquivalent!==null ? inrEquivalent : 0) : Number(a.amount||0), credit: 0
     });
   });
-  return entries.sort((a,b)=> new Date(a.date)-new Date(b.date));
+  return { entries: entries.sort((a,b)=> new Date(a.date)-new Date(b.date)), currency };
 }
 
 function buildCustomerLedgerEntries(customerId, currency){
@@ -1752,7 +1756,7 @@ function buildCustomerLedgerEntries(customerId, currency){
   DATA.invoices.filter(i=>i.customerId===customerId && i.currency===currency).forEach(inv=>{
     entries.push({
       date: inv.issueDate,
-      particulars: 'Invoice' + (inv.notes?(' — '+inv.notes):''),
+      particulars: 'Invoice',
       vchType: 'Invoice', vchNo: inv.invoiceNumber,
       debit: Number(inv.total||0), credit: 0
     });
@@ -1844,8 +1848,9 @@ function generateLedger(){
     balanceSign = 1;
     partyName = customerName(partyId);
   }else{
-    currency = 'USD';
-    entries = buildVendorLedgerEntries(partyId);
+    const built = buildVendorLedgerEntries(partyId);
+    entries = built.entries;
+    currency = built.currency;
     balanceSign = -1;
     partyName = vendorName(partyId);
   }
@@ -1857,7 +1862,7 @@ function generateLedger(){
   document.getElementById('ledger-output').innerHTML = `
     <div class="card">
       <div class="card-head">
-        <h3>${escapeHtml(partyName)} — ${fmtDate(from)} to ${fmtDate(to)}</h3>
+        <h3>${escapeHtml(partyName)} — ${fmtDate(from)} to ${fmtDate(to)} <span style="color:var(--muted);font-weight:400;font-size:0.85rem;">(in ${currency})</span></h3>
         <button class="btn btn-sm" onclick="downloadLedgerPDF()">Download PDF</button>
       </div>
       <table>
@@ -1922,7 +1927,7 @@ function downloadLedgerPDF(){
   doc.text('LEDGER STATEMENT', pageWidth-margin, 60, {align:'right'});
   doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...muted);
   doc.text((type==='customer'?'Customer: ':'Vendor: ') + partyName, pageWidth-margin, 80, {align:'right'});
-  doc.text(fmtDate(from) + ' to ' + fmtDate(to), pageWidth-margin, 94, {align:'right'});
+  doc.text(fmtDate(from) + ' to ' + fmtDate(to) + '  (in ' + currency + ')', pageWidth-margin, 94, {align:'right'});
 
   const ruleY = Math.max(leftY, 120) + 12;
   doc.setDrawColor(...brass); doc.setLineWidth(1.4);
