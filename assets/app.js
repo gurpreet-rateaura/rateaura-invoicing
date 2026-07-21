@@ -28,7 +28,31 @@ function fmtDate(d){
   if(isNaN(dt)) return d;
   return dt.toLocaleDateString('en-GB', {day:'2-digit', month:'short', year:'numeric'});
 }
+// Shows the time too, when the stored value actually carries one (from a
+// datetime-local field) — used in the Ledger so same-day entries stay distinguishable.
+function fmtDateTime(d){
+  if(!d) return '—';
+  const dt = new Date(d);
+  if(isNaN(dt)) return d;
+  const hasTime = /T\d{2}:\d{2}/.test(d);
+  const datePart = dt.toLocaleDateString('en-GB', {day:'2-digit', month:'short', year:'numeric'});
+  if(!hasTime) return datePart;
+  const timePart = dt.toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'});
+  return datePart + ', ' + timePart;
+}
 function todayISO(){ return new Date().toISOString().slice(0,10); }
+// Local (not UTC) date+time in the 'YYYY-MM-DDTHH:mm' shape <input type="datetime-local"> expects.
+function nowLocalISO(){
+  const d = new Date();
+  const pad = n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+// datetime-local inputs need the full 'YYYY-MM-DDTHH:mm' shape — older records saved
+// before time tracking only have 'YYYY-MM-DD', so pad those with a default time.
+function toDateTimeLocal(dateStr){
+  if(!dateStr) return nowLocalISO();
+  return /T\d{2}:\d{2}/.test(dateStr) ? String(dateStr).slice(0,16) : String(dateStr).slice(0,10)+'T00:00';
+}
 function uidTmp(){ return 'tmp_'+Math.random().toString(36).slice(2); }
 function escapeHtml(s){ return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
@@ -562,7 +586,7 @@ function openSettleModal(invId){
     </p>
     <div class="form-row">
       <div class="form-group"><label>Amount Received</label><input type="number" id="s-amount" step="0.01" value="${outstanding>0?outstanding.toFixed(2):''}"></div>
-      <div class="form-group"><label>Date</label><input type="date" id="s-date" value="${todayISO()}"></div>
+      <div class="form-group"><label>Date &amp; Time</label><input type="datetime-local" id="s-date" value="${nowLocalISO()}"></div>
     </div>
     <div class="form-group"><label>Method (wire, PayPal, etc.)</label><input type="text" id="s-method"></div>
     <div class="form-group full"><label>Note</label><input type="text" id="s-note"></div>
@@ -821,7 +845,7 @@ function openPayableModal(id){
       <div class="form-group"><label>Bill / Reference #</label><input type="text" id="p-billnumber" value="${p?escapeHtml(p.billNumber||''):''}"></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label>Bill Date</label><input type="date" id="p-billdate" value="${p?p.billDate:todayISO()}"></div>
+      <div class="form-group"><label>Bill Date &amp; Time</label><input type="datetime-local" id="p-billdate" value="${p?toDateTimeLocal(p.billDate):nowLocalISO()}"></div>
       <div class="form-group"><label>Due Date</label><input type="date" id="p-duedate" value="${p?p.dueDate:''}"></div>
     </div>
 
@@ -918,7 +942,7 @@ function openPaySettleModalUSD(p){
     </p>
     <div class="form-row">
       <div class="form-group"><label>Amount Paid (USD)</label><input type="number" id="ps-amount" step="0.01" value="${outstanding>0?outstanding.toFixed(2):''}"></div>
-      <div class="form-group"><label>Date</label><input type="date" id="ps-date" value="${todayISO()}"></div>
+      <div class="form-group"><label>Date &amp; Time</label><input type="datetime-local" id="ps-date" value="${nowLocalISO()}"></div>
     </div>
     <div class="form-group"><label>Method</label><input type="text" id="ps-method"></div>
     <div class="form-group full"><label>Note</label><input type="text" id="ps-note"></div>
@@ -967,7 +991,7 @@ function openPaySettleModalINR(p){
       Bill <strong>${escapeHtml(p.billNumber||'—')}</strong> — Remaining <strong>₹${fmtMoney(remainingInr,'INR')}</strong>
       (≈ <strong>$${fmtMoney(outstandingUsd,'USD')}</strong> at booking rate)
     </p>
-    <div class="form-group"><label>Payment Date</label><input type="date" id="ps-date" value="${todayISO()}"></div>
+    <div class="form-group"><label>Payment Date &amp; Time</label><input type="datetime-local" id="ps-date" value="${nowLocalISO()}"></div>
     <div class="section-title" style="margin-top:4px;">Allocation — split across advance batches and/or a new payment if needed</div>
     <table class="items-table">
       <thead><tr><th style="width:38%">Pay From</th><th>INR Amount</th><th>FX Rate</th><th>USD</th><th></th></tr></thead>
@@ -1287,7 +1311,8 @@ function updateExpensePreview(){
 /* ================= PROFIT & LOSS ================= */
 function inRange(dateStr, from, to){
   if(!dateStr) return false;
-  return dateStr >= from && dateStr <= to;
+  const d = String(dateStr).slice(0,10);
+  return d >= from && d <= to;
 }
 // A received payment's USD value — looks up the parent invoice's currency,
 // since Payments themselves don't store a currency (they're always in the
@@ -1580,7 +1605,7 @@ function customerAdvanceRows(){
       <td class="amount">${symbolFor(a.currency)}${fmtMoney(a.amount,a.currency)}</td>
       <td>${escapeHtml(a.method||'—')}</td>
       <td>${escapeHtml(a.note||'—')}</td>
-      <td><button class="btn btn-sm btn-ghost" onclick="removeCustomerAdvance('${a.id}')">✕</button></td>
+      <td><button class="btn btn-sm" onclick="openCustomerAdvanceModal('${a.id}')">Edit</button> <button class="btn btn-sm btn-ghost" onclick="removeCustomerAdvance('${a.id}')">✕</button></td>
     </tr>`).join('');
 }
 async function removeCustomerAdvance(id){
@@ -1589,21 +1614,22 @@ async function removeCustomerAdvance(id){
   await reloadData();
   navigate('advances');
 }
-function openCustomerAdvanceModal(){
-  const customerOptions = DATA.customers.map(c=>`<option value="${c.id}">${escapeHtml(c.name)}</option>`).join('');
+function openCustomerAdvanceModal(id){
+  const a = id ? DATA.customerAdvances.find(x=>x.id===id) : null;
+  const customerOptions = DATA.customers.map(c=>`<option value="${c.id}" ${a&&a.customerId===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('');
   const body = `
     <div class="form-row">
       <div class="form-group"><label>Customer</label><select id="ca-customer">${customerOptions || '<option value="">Add a customer first</option>'}</select></div>
-      <div class="form-group"><label>Date</label><input type="date" id="ca-date" value="${todayISO()}"></div>
+      <div class="form-group"><label>Date &amp; Time</label><input type="datetime-local" id="ca-date" value="${a?toDateTimeLocal(a.date):nowLocalISO()}"></div>
     </div>
     <div class="form-row">
-      <div class="form-group"><label>Currency</label><select id="ca-currency"><option value="USD">USD</option><option value="INR">INR</option></select></div>
-      <div class="form-group"><label>Amount</label><input type="number" step="0.01" id="ca-amount"></div>
+      <div class="form-group"><label>Currency</label><select id="ca-currency"><option value="USD" ${a&&a.currency==='USD'?'selected':''}>USD</option><option value="INR" ${a&&a.currency==='INR'?'selected':''}>INR</option></select></div>
+      <div class="form-group"><label>Amount</label><input type="number" step="0.01" id="ca-amount" value="${a?a.amount:''}"></div>
     </div>
-    <div class="form-group"><label>Method</label><input type="text" id="ca-method" placeholder="e.g. Wire, PayPal"></div>
-    <div class="form-group full"><label>Note</label><input type="text" id="ca-note"></div>
+    <div class="form-group"><label>Method</label><input type="text" id="ca-method" placeholder="e.g. Wire, PayPal" value="${a?escapeHtml(a.method||''):''}"></div>
+    <div class="form-group full"><label>Note</label><input type="text" id="ca-note" value="${a?escapeHtml(a.note||''):''}"></div>
   `;
-  openModal('Record Customer Advance', body, [
+  openModal(id?'Edit Customer Advance':'Record Customer Advance', body, [
     {label:'Cancel', cls:'btn', onClick:closeModal},
     {label:'Save', cls:'btn btn-gold', onClick: async ()=>{
       const customerId = document.getElementById('ca-customer').value;
@@ -1611,7 +1637,7 @@ function openCustomerAdvanceModal(){
       const amount = parseFloat(document.getElementById('ca-amount').value)||0;
       if(amount<=0){ alert('Enter a valid amount.'); return; }
       await apiPost('upsertCustomerAdvance', {
-        customerId,
+        id, customerId,
         date: document.getElementById('ca-date').value,
         currency: document.getElementById('ca-currency').value,
         amount,
@@ -1653,7 +1679,7 @@ function vendorAdvanceRows(){
       <td class="amount" style="color:${remaining>0.004?'var(--success)':'var(--muted)'};">$${fmtMoney(remaining,'USD')}</td>
       <td>${escapeHtml(a.method||'—')}</td>
       <td>${escapeHtml(a.note||'—')}</td>
-      <td><button class="btn btn-sm btn-ghost" onclick="removeVendorAdvance('${a.id}')">✕</button></td>
+      <td><button class="btn btn-sm" onclick="openVendorAdvanceModal('${a.id}')">Edit</button> <button class="btn btn-sm btn-ghost" onclick="removeVendorAdvance('${a.id}')">✕</button></td>
     </tr>`;
   }).join('');
 }
@@ -1665,27 +1691,38 @@ async function removeVendorAdvance(id){
 }
 function onVendorAdvanceVendorChange(){
   const type = vendorTypeOf(document.getElementById('va-vendor').value);
-  const grp = document.getElementById('va-fxrate-group');
+  const grp = document.getElementById('va-inr-fields');
   if(grp) grp.style.display = type==='INR' ? 'block' : 'none';
 }
-function openVendorAdvanceModal(){
-  const vendorOptions = DATA.vendors.map(v=>`<option value="${v.id}" data-type="${v.vendorType||'USD'}">${escapeHtml(v.name)} (${v.vendorType==='INR'?'INR':'USD'})</option>`).join('');
-  const initialType = DATA.vendors[0] ? (DATA.vendors[0].vendorType||'USD') : 'USD';
+function updateVendorAdvanceUsdPreview(){
+  const inrValue = parseFloat(document.getElementById('va-inrvalue')?.value)||0;
+  const fxRate = parseFloat(document.getElementById('va-fxrate')?.value)||0;
+  if(inrValue>0 && fxRate>0){
+    const amountField = document.getElementById('va-amount');
+    if(amountField) amountField.value = (inrValue/fxRate).toFixed(2);
+  }
+}
+function openVendorAdvanceModal(id){
+  const a = id ? DATA.vendorAdvances.find(x=>x.id===id) : null;
+  const vendorOptions = DATA.vendors.map(v=>`<option value="${v.id}" data-type="${v.vendorType||'USD'}" ${a&&a.vendorId===v.id?'selected':''}>${escapeHtml(v.name)} (${v.vendorType==='INR'?'INR':'USD'})</option>`).join('');
+  const initialType = a ? vendorTypeOf(a.vendorId) : (DATA.vendors[0] ? (DATA.vendors[0].vendorType||'USD') : 'USD');
   const body = `
     <div class="form-row">
       <div class="form-group"><label>Vendor</label><select id="va-vendor" onchange="onVendorAdvanceVendorChange()">${vendorOptions || '<option value="">Add a vendor first</option>'}</select></div>
-      <div class="form-group"><label>Date</label><input type="date" id="va-date" value="${todayISO()}"></div>
+      <div class="form-group"><label>Date &amp; Time</label><input type="datetime-local" id="va-date" value="${a?toDateTimeLocal(a.date):nowLocalISO()}"></div>
     </div>
-    <div class="form-group"><label>Amount (USD — the actual amount remitted)</label><input type="number" step="0.01" id="va-amount"></div>
-    <div class="form-group" id="va-fxrate-group" style="display:${initialType==='INR'?'block':'none'};">
-      <label>FX Rate at Payment (INR per USD)</label>
-      <input type="number" step="0.0001" id="va-fxrate">
-      <p style="color:var(--muted);font-size:0.78rem;margin:6px 0 0;">This rate gets locked to this advance batch — when you later apply it to a bill, this exact rate is reused automatically, so forex gain/loss stays accurate.</p>
+    <div id="va-inr-fields" style="display:${initialType==='INR'?'block':'none'};">
+      <div class="form-row">
+        <div class="form-group"><label>INR Value (the exact figure you remitted)</label><input type="number" step="0.01" id="va-inrvalue" value="${a?a.inrValue:''}" oninput="updateVendorAdvanceUsdPreview()"></div>
+        <div class="form-group"><label>FX Rate at Payment (INR per USD)</label><input type="number" step="0.0001" id="va-fxrate" value="${a?a.fxRateAtPayment:''}" oninput="updateVendorAdvanceUsdPreview()"></div>
+      </div>
+      <p style="color:var(--muted);font-size:0.78rem;margin:-6px 0 12px;">This rate gets locked to this advance batch — when you later apply it to a bill, this exact rate is reused automatically, so forex gain/loss stays accurate.</p>
     </div>
-    <div class="form-group"><label>Method</label><input type="text" id="va-method" placeholder="e.g. Wire, SWIFT"></div>
-    <div class="form-group full"><label>Note</label><input type="text" id="va-note"></div>
+    <div class="form-group"><label>Amount (USD — the actual amount remitted)</label><input type="number" step="0.01" id="va-amount" value="${a?a.amount:''}"></div>
+    <div class="form-group"><label>Method</label><input type="text" id="va-method" placeholder="e.g. Wire, SWIFT" value="${a?escapeHtml(a.method||''):''}"></div>
+    <div class="form-group full"><label>Note</label><input type="text" id="va-note" value="${a?escapeHtml(a.note||''):''}"></div>
   `;
-  openModal('Record Vendor Advance', body, [
+  openModal(id?'Edit Vendor Advance':'Record Vendor Advance', body, [
     {label:'Cancel', cls:'btn', onClick:closeModal},
     {label:'Save', cls:'btn btn-gold', onClick: async ()=>{
       const vendorId = document.getElementById('va-vendor').value;
@@ -1693,15 +1730,17 @@ function openVendorAdvanceModal(){
       const amount = parseFloat(document.getElementById('va-amount').value)||0;
       if(amount<=0){ alert('Enter a valid amount.'); return; }
       const vendorType = vendorTypeOf(vendorId);
-      let fxRateAtPayment = '';
+      let fxRateAtPayment = '', inrValue = '';
       if(vendorType === 'INR'){
         fxRateAtPayment = parseFloat(document.getElementById('va-fxrate').value)||0;
+        inrValue = parseFloat(document.getElementById('va-inrvalue').value)||0;
         if(fxRateAtPayment<=0){ alert('Enter the FX rate this advance was paid at.'); return; }
+        if(inrValue<=0){ alert('Enter the INR value of this advance.'); return; }
       }
       await apiPost('upsertVendorAdvance', {
-        vendorId,
+        id, vendorId,
         date: document.getElementById('va-date').value,
-        amount, fxRateAtPayment,
+        amount, fxRateAtPayment, inrValue,
         method: document.getElementById('va-method').value,
         note: document.getElementById('va-note').value
       });
@@ -1740,7 +1779,7 @@ function buildVendorLedgerEntries(vendorId){
     });
   });
   DATA.vendorAdvances.filter(a=>a.vendorId===vendorId).forEach(a=>{
-    const inrEquivalent = a.fxRateAtPayment ? Number(a.amount||0) * Number(a.fxRateAtPayment) : null;
+    const inrEquivalent = a.inrValue ? Number(a.inrValue) : (a.fxRateAtPayment ? Number(a.amount||0) * Number(a.fxRateAtPayment) : null);
     entries.push({
       date: a.date,
       particulars: 'Advance Paid' + (a.method?(' — '+a.method):'') + (a.note?(' — '+a.note):''),
@@ -1788,9 +1827,9 @@ function buildCustomerLedgerEntries(customerId, currency){
 // credit − debit, i.e. what we owe them)
 function computeLedger(entries, from, to, balanceSign){
   let opening = 0;
-  entries.forEach(e=>{ if(e.date < from) opening += balanceSign*(e.debit - e.credit); });
+  entries.forEach(e=>{ if(String(e.date).slice(0,10) < from) opening += balanceSign*(e.debit - e.credit); });
   let running = opening;
-  const rows = entries.filter(e=> e.date>=from && e.date<=to).map(e=>{
+  const rows = entries.filter(e=> { const d = String(e.date).slice(0,10); return d>=from && d<=to; }).map(e=>{
     running += balanceSign*(e.debit - e.credit);
     return Object.assign({}, e, {balance: running});
   });
@@ -1874,7 +1913,7 @@ function generateLedger(){
           </tr>
           ${ledger.rows.length ? ledger.rows.map(r=>`
             <tr>
-              <td>${fmtDate(r.date)}</td>
+              <td>${fmtDateTime(r.date)}</td>
               <td>${escapeHtml(r.particulars)}</td>
               <td>${escapeHtml(r.vchType)}</td>
               <td class="mono">${escapeHtml(r.vchNo)}</td>
@@ -1936,7 +1975,7 @@ function downloadLedgerPDF(){
   const balanceLabel = type==='customer' ? 'Dr' : 'Cr';
   const rows = [
     ['', 'Opening Balance', '', '', '', '', sym+fmtMoney(Math.abs(ledger.opening),currency)],
-    ...ledger.rows.map(r=>[fmtDate(r.date), r.particulars, r.vchType, r.vchNo, r.debit>0.004?sym+fmtMoney(r.debit,currency):'', r.credit>0.004?sym+fmtMoney(r.credit,currency):'', sym+fmtMoney(Math.abs(r.balance),currency)])
+    ...ledger.rows.map(r=>[fmtDateTime(r.date), r.particulars, r.vchType, r.vchNo, r.debit>0.004?sym+fmtMoney(r.debit,currency):'', r.credit>0.004?sym+fmtMoney(r.credit,currency):'', sym+fmtMoney(Math.abs(r.balance),currency)])
   ];
 
   doc.autoTable({
